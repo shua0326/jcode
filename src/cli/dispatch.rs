@@ -1,6 +1,6 @@
 #![cfg_attr(test, allow(clippy::await_holding_lock))]
 
-use anyhow::Result;
+use anyhow::{Context, Result};
 use std::io::IsTerminal;
 use std::process::{Command as ProcessCommand, Stdio};
 use std::time::Instant;
@@ -1196,6 +1196,19 @@ fn try_acquire_spawn_lock(path: &std::path::Path) -> Result<Option<SpawnLockGuar
     use std::fs::OpenOptions;
     use std::os::fd::AsRawFd;
 
+    // Fresh runtime directories must exist before the client creates its lock;
+    // the daemon's socket-directory creation runs only after this step.
+    if let Some(parent) = path
+        .parent()
+        .filter(|parent| !parent.as_os_str().is_empty())
+    {
+        std::fs::create_dir_all(parent).with_context(|| {
+            format!(
+                "Failed to create JCode runtime directory {}",
+                parent.display()
+            )
+        })?;
+    }
     let file = OpenOptions::new()
         .create(true)
         .write(true)
@@ -1335,7 +1348,7 @@ pub(crate) async fn spawn_server(
     spawn_server_with_executable(provider_choice, model, provider_profile, None).await
 }
 
-async fn spawn_server_with_executable(
+pub(super) async fn spawn_server_with_executable(
     provider_choice: &ProviderChoice,
     model: Option<&str>,
     provider_profile: Option<&str>,

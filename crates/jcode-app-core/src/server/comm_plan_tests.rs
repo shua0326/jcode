@@ -581,7 +581,7 @@ async fn approve_plan_accepts_valid_dag_proposal() {
 /// If a production fix routes these sites through fanout delivery, the
 /// "lost" assertions below start failing: flip them to assert delivery.
 #[tokio::test]
-async fn direct_update_notification_is_lost_on_stale_cached_event_tx() {
+async fn direct_update_plan_reaches_live_attachment_after_reconnect() {
     let (_env, _runtime) = RuntimeEnvGuard::new();
     let mut fx = plan_fixture("swarm-plan-stale-tx", "coord-st", "worker-st");
     let coord = fx.coord.clone();
@@ -613,28 +613,31 @@ async fn direct_update_notification_is_lost_on_stale_cached_event_tx() {
     // worker a plan participant, so the notify loop targets it.
     let mut item = plan_item("a", &[]);
     item.assigned_to = Some(worker.clone());
-    fx.propose(&coord, vec![item]).await;
+    tokio::time::timeout(
+        std::time::Duration::from_secs(2),
+        fx.propose(&coord, vec![item]),
+    )
+    .await
+    .expect("plan update must not deadlock while routing to live attachments");
 
     let events = fx.drain_events();
     assert!(saw_done(&events), "direct update should ack: {events:?}");
 
-    // Lossy pin: neither the "Plan updated" Notification (comm_plan.rs raw
-    // send) nor the SwarmPlan broadcast (swarm.rs raw send) reached the live
-    // attachment. Both went to the closed cached channel.
+    // Structured plans must reach live attachments even when the cached sender is closed.
     let mut delivered = Vec::new();
     while let Ok(event) = live_rx.try_recv() {
         delivered.push(event);
     }
     assert!(
-        delivered.is_empty(),
-        "raw event_tx sends currently bypass live event_txs attachments; if \
-         events now arrive here, the delivery gap was fixed - update this \
-         test and the wiring audit: {delivered:?}"
+        delivered
+            .iter()
+            .any(|event| matches!(event, ServerEvent::SwarmPlan { .. })),
+        "plan must reach the reattached live client: {delivered:?}"
     );
 
     // The fallback that does exist for this site: the plan-update text was
     // queued as a soft interrupt, so a live agent still learns of the change
-    // even though the structured UI events were dropped.
+    // alongside the structured plan delivered to the UI.
     {
         let pending = interrupt_queue.lock().expect("queue lock");
         assert_eq!(pending.len(), 1, "soft-interrupt fallback should fire");

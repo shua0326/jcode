@@ -1214,3 +1214,42 @@ async fn test_detached_promoted_command_reports_intermediate_progress() {
     let _ = tokio::fs::remove_file(output_file).await;
     let _ = tokio::fs::remove_file(status_file).await;
 }
+
+#[tokio::test]
+async fn acp_shell_output_arrives_before_command_finishes() {
+    let mut events = crate::bus::Bus::global().subscribe();
+    let ctx = ToolContext {
+        session_id: "acp-stream-test".into(),
+        message_id: "m".into(),
+        tool_call_id: "stream-test".into(),
+        working_dir: None,
+        stdin_request_tx: None,
+        graceful_shutdown_signal: None,
+        execution_mode: crate::tool::ToolExecutionMode::Direct,
+    };
+    let task = tokio::spawn(async move {
+        BashTool::new()
+            .execute(
+                json!({"command":"printf 'first\n'; sleep 1; printf 'last\n'"}),
+                ctx,
+            )
+            .await
+    });
+    let progress = tokio::time::timeout(std::time::Duration::from_millis(800), async {
+        loop {
+            if let Ok(crate::bus::BusEvent::ToolOutput {
+                session_id, output, ..
+            }) = events.recv().await
+            {
+                if session_id == "acp-stream-test" {
+                    break output;
+                }
+            }
+        }
+    })
+    .await
+    .expect("output should arrive before command completes");
+    assert!(progress.contains("first"));
+    assert!(!task.is_finished());
+    assert!(task.await.unwrap().is_ok());
+}

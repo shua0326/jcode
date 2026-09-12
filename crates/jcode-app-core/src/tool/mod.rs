@@ -1,3 +1,4 @@
+pub(crate) mod acp_editor;
 mod agentgrep;
 pub mod ambient;
 mod apply_patch;
@@ -833,6 +834,7 @@ impl Registry {
         );
 
         let started_at = std::time::Instant::now();
+        acp_editor::check(resolved_name, &input, &ctx).await?;
         let result = tool.execute(input.clone(), ctx.clone()).await;
         let latency_ms = started_at.elapsed().as_millis().min(u128::from(u64::MAX)) as u64;
 

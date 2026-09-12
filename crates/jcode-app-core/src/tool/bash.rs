@@ -506,6 +506,7 @@ async fn apply_progress_update(task_id: &str, update: ProgressLineUpdate) {
 /// of 0%, and later updates stream directly to the background manager.
 #[derive(Default)]
 struct PromotedCommandProgress {
+    stream: Option<std::sync::Mutex<CommandOutputStream>>,
     task_id: std::sync::OnceLock<String>,
     pending: std::sync::Mutex<Option<ProgressLineUpdate>>,
 }
@@ -537,6 +538,45 @@ impl PromotedCommandProgress {
     }
 }
 
+/// Output snapshots are bounded and throttled independently of final tool output.
+struct CommandOutputStream {
+    session_id: String,
+    tool_call_id: String,
+    text: String,
+    last_emit: Option<Instant>,
+}
+impl CommandOutputStream {
+    fn new(ctx: &ToolContext) -> Self {
+        Self {
+            session_id: ctx.session_id.clone(),
+            tool_call_id: ctx.tool_call_id.clone(),
+            text: String::new(),
+            last_emit: None,
+        }
+    }
+    fn append(&mut self, text: &str) {
+        self.text.push_str(text);
+        if self.text.len() > 65536 {
+            let mut start = self.text.len() - 65536;
+            while !self.text.is_char_boundary(start) {
+                start += 1;
+            }
+            self.text.drain(..start);
+        }
+        if self
+            .last_emit
+            .is_none_or(|t| t.elapsed() >= Duration::from_millis(200))
+        {
+            crate::bus::Bus::global().publish(crate::bus::BusEvent::ToolOutput {
+                session_id: self.session_id.clone(),
+                tool_call_id: self.tool_call_id.clone(),
+                output: self.text.clone(),
+            });
+            self.last_emit = Some(Instant::now());
+        }
+    }
+}
+
 /// Collect a command's output stream line by line, reporting any parsed
 /// progress so a later background promotion has live progress instead of
 /// sitting at 0% until completion.
@@ -555,6 +595,12 @@ where
     while let Ok(Some(line)) = lines.next_line().await {
         if let Ok(Some(update)) = parse_progress_line(&line) {
             progress.record(update).await;
+        }
+        if let Some(stream) = &progress.stream {
+            stream
+                .lock()
+                .unwrap_or_else(|e| e.into_inner())
+                .append(&format!("{line}\n"));
         }
         buf.push_str(&line);
         buf.push('\n');
@@ -951,7 +997,10 @@ impl BashTool {
         let title_for_work = title.clone();
         // Track progress parsed from output so a timeout promotion starts the
         // background task at the real percentage instead of 0%.
-        let promoted_progress = std::sync::Arc::new(PromotedCommandProgress::default());
+        let promoted_progress = std::sync::Arc::new(PromotedCommandProgress {
+            stream: Some(std::sync::Mutex::new(CommandOutputStream::new(ctx))),
+            ..Default::default()
+        });
         let stdout_progress = std::sync::Arc::clone(&promoted_progress);
         let stderr_progress = std::sync::Arc::clone(&promoted_progress);
 
@@ -1154,8 +1203,26 @@ impl BashTool {
         let mut child = crate::platform::spawn_detached(&mut cmd)?;
         let pid = child.id();
         let shutdown_signal = ctx.graceful_shutdown_signal.clone();
+        let mut stream = CommandOutputStream::new(ctx);
+        let mut output_offset = 0u64;
 
         loop {
+            if let Ok(mut file) = tokio::fs::File::open(&info.output_file).await {
+                use tokio::io::AsyncSeekExt;
+                if file
+                    .seek(std::io::SeekFrom::Start(output_offset))
+                    .await
+                    .is_ok()
+                {
+                    let mut chunk = [0u8; 8192];
+                    if let Ok(n) = file.read(&mut chunk).await {
+                        output_offset += n as u64;
+                        if n > 0 {
+                            stream.append(&String::from_utf8_lossy(&chunk[..n]));
+                        }
+                    }
+                }
+            }
             if let Some(status) = child.try_wait()? {
                 let output = tokio::fs::read_to_string(&info.output_file)
                     .await

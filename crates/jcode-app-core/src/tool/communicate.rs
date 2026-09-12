@@ -901,20 +901,25 @@ async fn run_swarm_plan_in_background(
     } else {
         "Notifications disabled. Use the `bg` tool to check status."
     };
+    let progress_note = if wake {
+        "No follow-up wait is needed: finish independent work and end the turn. The completion event will wake you."
+    } else {
+        "Inspect only when needed with `bg status` or `swarm plan_status`; avoid repeated polling."
+    };
     let output = format!(
         "🐝 Swarm plan running in background.\n\n\
          Task ID: {}\n\
          Plan: {} node(s), {} mode\n\
          Output file: {}\n\n\
          {}\n\
-         Check progress: use the `bg` tool with action=\"status\" and task_id=\"{}\", or `swarm plan_status`.\n\
+         {}\n\
          Note: a server reload stops this driver (workers keep running); rerun `swarm run_plan` to resume driving the same plan.",
         info.task_id,
         initial_summary.item_count,
         initial_summary.mode,
         info.output_file.display(),
         delivery_note,
-        info.task_id,
+        progress_note,
     );
 
     Ok(ToolOutput::new(output)
@@ -1791,8 +1796,7 @@ impl CommunicateTool {
     }
 
     fn new_for_working_dir(working_dir: Option<&std::path::Path>) -> Self {
-        const BASE_DESCRIPTION: &str =
-            "Coordinate agents: spawn workers with a prompt, message them, and manage swarm plans.";
+        const BASE_DESCRIPTION: &str = "Coordinate agents: spawn workers, message them, and manage swarm plans. Task-DAG workflow: call task_graph once with nodes, then run_plan without nodes or plan_items. Background run_plan already wakes the coordinator on completion; do not add bg wait or status polling.";
         let swarm_prompt = crate::prompt::load_swarm_prompt(working_dir);
         let description = if swarm_prompt.is_empty() {
             BASE_DESCRIPTION.to_string()
@@ -1972,7 +1976,7 @@ impl Tool for CommunicateTool {
                              "task_graph", "expand_node", "complete_node", "inject_gap",
                              "start", "start_task", "wake", "resume", "retry", "reassign", "replace", "salvage",
                              "subscribe_channel", "unsubscribe_channel", "await_members", "list_models"],
-                    "description": "Action. spawn requires label and should include prompt. list_models shows available models/routes."
+                    "description": "Action. For a task DAG: task_graph with nodes once, then run_plan without nodes/plan_items. Inspect plan_status before reseeding. spawn requires label and should include prompt. list_models shows available models/routes."
                 },
                 "key": {
                     "type": "string",
@@ -2084,11 +2088,11 @@ impl Tool for CommunicateTool {
                 "timeout_minutes": {
                     "type": "integer",
                     "minimum": 1,
-                    "description": "Optional timeout for await_members."
+                    "description": "Timeout for blocking or notify-only waits. Background wake=true watches remain subscribed across unchanged health-check deadlines and wake only on completion."
                 },
                 "background": {
                     "type": "boolean",
-                    "description": "For run_plan: detach as a background task (default true); false blocks until the plan resolves."
+                    "description": "For run_plan: detach and wake this coordinator once on completion (default true). Do not follow a background run with bg wait/status polling. Use false for a small plan whose result is required in this turn."
                 },
                 "notify": {
                     "type": "boolean",
@@ -2118,8 +2122,16 @@ impl Tool for CommunicateTool {
                 },
                 "plan_items": {
                     "type": "array",
+                    "description": "Only for the legacy propose_plan action. Do not send with task_graph or run_plan.",
                     "items": {
                         "type": "object",
+                        "required": ["id", "content", "status", "priority"],
+                        "properties": {
+                            "id": {"type": "string"},
+                            "content": {"type": "string"},
+                            "status": {"type": "string"},
+                            "priority": {"type": "string"}
+                        },
                         "additionalProperties": true
                     }
                 }
@@ -2150,8 +2162,19 @@ impl Tool for CommunicateTool {
                 "nodes".to_string(),
                 json!({
                     "type": "array",
-                    "description": "Node specs for task_graph/expand_node/inject_gap. Each: {id, content, kind?, depends_on?, priority?}.",
-                    "items": { "type": "object", "additionalProperties": true }
+                    "description": "Only for task_graph/expand_node/inject_gap; never send with run_plan. Each priority is an integer 0-255.",
+                    "items": {
+                        "type": "object",
+                        "required": ["id", "content"],
+                        "properties": {
+                            "id": {"type": "string"},
+                            "content": {"type": "string"},
+                            "kind": {"type": "string", "enum": ["explore", "implement", "verify", "fix", "synthesize"]},
+                            "depends_on": {"type": "array", "items": {"type": "string"}},
+                            "priority": {"type": "integer", "minimum": 0, "maximum": 255}
+                        },
+                        "additionalProperties": false
+                    }
                 }),
             );
             props.insert(
@@ -3144,6 +3167,11 @@ impl Tool for CommunicateTool {
             }
 
             "run_plan" => {
+                if params.nodes.is_some() || params.plan_items.is_some() {
+                    return Err(anyhow::anyhow!(
+                        "run_plan starts the existing graph and accepts neither 'nodes' nor 'plan_items'. Seed once with `swarm task_graph` using integer node priorities, then call `swarm run_plan` without either field."
+                    ));
+                }
                 // Background-by-default: the plan driver runs as a managed
                 // background task (progress card, bg tool, notify/wake) so the
                 // coordinating agent stays responsive. Pass background=false

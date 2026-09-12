@@ -1753,15 +1753,23 @@ async fn handle_comm_assign_task_with_mode(
         let agent_sessions = sessions.read().await;
         agent_sessions.get(&target_session).cloned()
     };
-    let _ = queue_soft_interrupt_for_session(
-        &target_session,
-        queued_task_prompt,
-        false,
-        SoftInterruptSource::System,
-        soft_interrupt_queues,
-        sessions,
-    )
-    .await;
+    let target_has_client = {
+        let connections = client_connections.read().await;
+        connections
+            .values()
+            .any(|connection| connection.session_id == target_session)
+    };
+    if target_has_client || target_agent.is_none() {
+        let _ = queue_soft_interrupt_for_session(
+            &target_session,
+            queued_task_prompt,
+            false,
+            SoftInterruptSource::System,
+            soft_interrupt_queues,
+            sessions,
+        )
+        .await;
+    }
     if let Some(member) = swarm_members.read().await.get(&target_session) {
         let _ = member.event_tx.send(ServerEvent::Notification {
             from_session: req_session_id.clone(),
@@ -1775,12 +1783,6 @@ async fn handle_comm_assign_task_with_mode(
         });
     }
 
-    let target_has_client = {
-        let connections = client_connections.read().await;
-        connections
-            .values()
-            .any(|connection| connection.session_id == target_session)
-    };
     if !target_has_client && let Some(agent_arc) = target_agent {
         let target_session_for_run = target_session.clone();
         let swarm_members_for_run = Arc::clone(swarm_members);

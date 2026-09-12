@@ -866,6 +866,11 @@ pub(super) async fn handle_client(
             // Forward bus events to this client
             bus_event = bus_rx.recv(), if client_subscribed => {
                 match bus_event {
+                    Ok(BusEvent::ToolOutput { session_id, tool_call_id, output }) => {
+                        if session_id == client_session_id {
+                            let _ = client_event_tx.send(ServerEvent::ToolOutput { id: tool_call_id, output });
+                        }
+                    }
                     Ok(BusEvent::ModelsUpdated) => {
                         let Some(event) = try_available_models_updated_event(&agent) else {
                             crate::logging::info(&format!(
@@ -1777,6 +1782,53 @@ pub(super) async fn handle_client(
                 send_swarm_plan_to_session(&client_session_id, &swarm_members, &swarm_plans).await;
                 if let Some(snapshot) = try_available_models_snapshot(&agent) {
                     last_available_models_snapshot = Some(snapshot);
+                }
+            }
+
+            Request::AcpFileContent { id, request_id, content, error } => {
+                crate::tool::acp_editor::reply(&client_session_id, &request_id, content, error);
+                let _ = client_event_tx.send(ServerEvent::Done { id });
+            }
+            Request::ConfigureAcpMcp { id, servers, editor_read } => {
+                if client_is_processing {
+                    let _ = client_event_tx.send(ServerEvent::Error { id, message: "Cannot replace MCP tools during a running turn".into(), retry_after_secs: None });
+                    continue;
+                }
+                crate::tool::acp_editor::install(&client_session_id, editor_read.then(|| client_event_tx.clone()));
+                let config: Result<crate::mcp::McpConfig, _> = serde_json::from_value(servers);
+                let result = async {
+                    let config = config.map_err(|e| anyhow::anyhow!("Invalid ACP MCP configuration: {e}"))?;
+                    if config.servers.keys().any(|name| !name.starts_with("acp_zed_")) || config.servers.values().any(|server| !server.is_stdio() || server.shared) {
+                        anyhow::bail!("ACP MCP requires private, prefixed stdio servers");
+                    }
+                    let manager = Arc::new(tokio::sync::RwLock::new(crate::mcp::McpManager::with_config(config)));
+                    let (_, failures) = tokio::time::timeout(std::time::Duration::from_secs(30), manager.read().await.connect_all()).await.map_err(|_| anyhow::anyhow!("Zed MCP connection timed out"))??;
+                    if !failures.is_empty() {
+                        manager.read().await.disconnect_all().await;
+                        anyhow::bail!("Could not connect Zed MCP servers: {}", failures.iter().map(|(name, _)| name.as_str()).collect::<Vec<_>>().join(", "));
+                    }
+                    let tools = crate::mcp::create_mcp_tools(manager).await;
+                    let registry = agent.lock().await.registry();
+                    registry.unregister_prefix("mcp__acp_zed_").await;
+                    for (name, tool) in tools { registry.register(name, tool).await; }
+                    Ok::<(), anyhow::Error>(())
+                }.await;
+                match result {
+                    Ok(()) => { let _ = client_event_tx.send(ServerEvent::Done { id }); }
+                    Err(err) => { let _ = client_event_tx.send(ServerEvent::Error { id, message: err.to_string(), retry_after_secs: None }); }
+                }
+            }
+
+            Request::GetAcpHistory { id } => {
+                let result = if let Ok(agent) = agent.try_lock() {
+                    Ok(super::client_state::acp_history_messages(agent.session_for_split()))
+                } else {
+                    crate::session::Session::load_for_remote_startup(&client_session_id)
+                        .map(|session| super::client_state::acp_history_messages(&session))
+                };
+                match result {
+                    Ok(messages) => { let _ = client_event_tx.send(ServerEvent::AcpHistory { id, messages }); }
+                    Err(err) => { let _ = client_event_tx.send(ServerEvent::Error { id, message:format!("Cannot load structured history: {err}"), retry_after_secs:None }); }
                 }
             }
 

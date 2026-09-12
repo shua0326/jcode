@@ -896,13 +896,10 @@ pub(super) async fn broadcast_swarm_plan_with_previous(
         summary: Some(summary),
     };
 
-    let members = swarm_members.read().await;
     let participant_count = participants.len();
     let mut delivered_count = 0usize;
     for sid in participants {
-        if let Some(member) = members.get(&sid)
-            && member.event_tx.send(event.clone()).is_ok()
-        {
+        if fanout_session_event(swarm_members, &sid, event.clone()).await > 0 {
             delivered_count += 1;
         }
     }
@@ -963,10 +960,7 @@ pub(super) async fn send_swarm_plan_to_session(
         }
     };
 
-    let members = swarm_members.read().await;
-    if let Some(member) = members.get(session_id) {
-        let _ = member.event_tx.send(event);
-    }
+    let _ = fanout_session_event(swarm_members, session_id, event).await;
 }
 
 pub(super) async fn rename_plan_participant(

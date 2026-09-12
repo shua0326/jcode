@@ -1301,6 +1301,24 @@ fn schema_advertises_supported_swarm_fields() {
         props["plan_items"]["items"]["additionalProperties"],
         json!(true)
     );
+    assert_eq!(
+        props["plan_items"]["items"]["properties"]["priority"]["type"],
+        json!("string")
+    );
+    assert!(
+        props["plan_items"]["description"]
+            .as_str()
+            .expect("plan_items description")
+            .contains("Do not send with task_graph or run_plan")
+    );
+    assert_eq!(
+        props["nodes"]["items"]["properties"]["priority"]["type"],
+        json!("integer")
+    );
+    assert_eq!(
+        props["nodes"]["items"]["additionalProperties"],
+        json!(false)
+    );
     assert!(
         schema["properties"]["action"]["enum"]
             .as_array()
@@ -1360,6 +1378,27 @@ fn schema_advertises_supported_swarm_fields() {
             .as_array()
             .expect("action enum")
             .contains(&json!("salvage"))
+    );
+}
+
+#[tokio::test]
+async fn run_plan_rejects_graph_payloads_before_starting_a_driver() {
+    let dir = tempfile::tempdir().unwrap();
+    let ctx = test_ctx("run-plan-schema-guard", dir.path());
+    let error = CommunicateTool::new()
+        .execute(
+            json!({
+                "action": "run_plan",
+                "nodes": [{"id": "research", "content": "Research", "priority": 1}]
+            }),
+            ctx,
+        )
+        .await
+        .expect_err("run_plan must reject task_graph fields");
+    assert!(
+        error
+            .to_string()
+            .contains("Seed once with `swarm task_graph`")
     );
 }
 

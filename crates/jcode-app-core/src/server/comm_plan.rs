@@ -163,6 +163,8 @@ pub(super) async fn handle_comm_propose_plan(
             .await;
         }
 
+        drop(members); // Live attachment fanout below needs the member write lock.
+
         let swarm_state = SwarmState {
             members: Arc::clone(swarm_members),
             swarms_by_id: Arc::clone(swarms_by_id),

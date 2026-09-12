@@ -314,3 +314,18 @@ async fn server_is_running_at_treats_live_listener_as_running_without_pong() {
         "a live listener should prevent duplicate server spawns even if ping is slow or absent"
     );
 }
+
+#[cfg(unix)]
+#[test]
+fn spawn_lock_creates_missing_runtime_directory() {
+    let root = tempfile::tempdir().unwrap();
+    let path = root.path().join("missing/nested/jcode.sock.spawning");
+    assert!(!path.parent().unwrap().exists());
+    let guard = super::try_acquire_spawn_lock(&path)
+        .unwrap()
+        .expect("acquire fresh lock");
+    assert!(path.exists());
+    drop(guard);
+    assert!(!path.exists());
+    assert!(path.parent().unwrap().is_dir());
+}
