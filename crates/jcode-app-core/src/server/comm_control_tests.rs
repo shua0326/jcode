@@ -139,7 +139,9 @@ impl Provider for TestProvider {
 
 async fn test_agent() -> Arc<Mutex<Agent>> {
     let provider: Arc<dyn Provider> = Arc::new(TestProvider);
-    let registry = Registry::new(provider.clone()).await;
+    // These coordinator tests do not execute tools. Avoid constructing the
+    // network-backed base registry, which also makes the tests hermetic.
+    let registry = Registry::empty();
     Arc::new(Mutex::new(Agent::new(provider, registry)))
 }
 

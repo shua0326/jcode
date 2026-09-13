@@ -942,3 +942,120 @@ pub(super) fn spawn_model_prefetch_update(provider: Arc<dyn Provider>, agent: Ar
 #[cfg(test)]
 #[path = "client_state_tests.rs"]
 mod client_state_tests;
+
+/// ACP history retains block types; TUI-rendered markdown is not a wire format.
+pub(super) fn acp_history_messages(session: &Session) -> Vec<HistoryMessage> {
+    let mut result = Vec::new();
+    let mut tools = HashMap::new();
+    for message in &session.messages {
+        let role = match message.role {
+            Role::User => "user",
+            Role::Assistant => "assistant",
+        };
+        if message.display_role.is_some() {
+            continue;
+        }
+        // Match the native transcript's reasoning-before-answer order.
+        for block in &message.content {
+            if let ContentBlock::Reasoning { text } | ContentBlock::ReasoningTrace { text } = block
+            {
+                if !text.is_empty() {
+                    result.push(HistoryMessage {
+                        response_stats: None,
+                        role: "thought".into(),
+                        content: text.clone(),
+                        tool_calls: None,
+                        tool_data: None,
+                    });
+                }
+            }
+        }
+        for block in &message.content {
+            let item = match block {
+                ContentBlock::Text { text, .. } => Some(HistoryMessage {
+                    response_stats: None,
+                    role: role.into(),
+                    content: text.clone(),
+                    tool_calls: None,
+                    tool_data: None,
+                }),
+                ContentBlock::ToolUse {
+                    id, name, input, ..
+                } => {
+                    let tool = crate::message::ToolCall {
+                        id: id.clone(),
+                        name: name.clone(),
+                        input: input.clone(),
+                        intent: None,
+                        thought_signature: None,
+                    };
+                    tools.insert(id.clone(), tool.clone());
+                    Some(HistoryMessage {
+                        response_stats: None,
+                        role: "tool_call".into(),
+                        content: String::new(),
+                        tool_calls: None,
+                        tool_data: Some(tool),
+                    })
+                }
+                ContentBlock::ToolResult {
+                    tool_use_id,
+                    content,
+                    is_error,
+                    ..
+                } => {
+                    let tool = tools.get(tool_use_id).cloned().unwrap_or_else(|| {
+                        crate::message::ToolCall {
+                            id: tool_use_id.clone(),
+                            name: "tool".into(),
+                            ..Default::default()
+                        }
+                    });
+                    Some(HistoryMessage {
+                        response_stats: None,
+                        role: if is_error.unwrap_or(false) {
+                            "tool_error"
+                        } else {
+                            "tool"
+                        }
+                        .into(),
+                        content: content.clone(),
+                        tool_calls: None,
+                        tool_data: Some(tool),
+                    })
+                }
+                // Encrypted provider state/signatures are never display text.
+                _ => None,
+            };
+            if let Some(item) = item {
+                result.push(item);
+            }
+        }
+    }
+    result
+}
+
+#[cfg(test)]
+mod acp_replay_tests {
+    use super::*;
+    #[test]
+    fn structured_history_keeps_thoughts_tools_errors_and_answer_distinct() {
+        let mut session = Session::create_with_id("replay-fixture".into(), None, None);
+        session.messages=serde_json::from_value(serde_json::json!([
+            {"id":"a","role":"assistant","content":[{"type":"text","text":"Answer"},{"type":"reasoning_trace","text":"Fixture thought"},{"type":"tool_use","id":"t","name":"view_file","input":{"path":"/fixture"}},{"type":"anthropic_thinking","thinking":"signed state","signature":"do-not-display"}]},
+            {"id":"b","role":"user","content":[{"type":"tool_result","tool_use_id":"t","content":"fixture error","is_error":true}]}
+        ])).unwrap();
+        let history = acp_history_messages(&session);
+        assert_eq!(
+            history.iter().map(|m| m.role.as_str()).collect::<Vec<_>>(),
+            vec!["thought", "assistant", "tool_call", "tool_error"]
+        );
+        assert_eq!(history[0].content, "Fixture thought");
+        assert_eq!(history[3].tool_data.as_ref().unwrap().id, "t");
+        assert!(
+            !serde_json::to_string(&history)
+                .unwrap()
+                .contains("do-not-display")
+        );
+    }
+}

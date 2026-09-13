@@ -160,6 +160,26 @@ pub enum Request {
     #[serde(rename = "get_history")]
     GetHistory { id: u64 },
 
+    /// Install client-supplied stdio MCP tools only in this session's registry.
+    #[serde(rename = "configure_acp_mcp")]
+    ConfigureAcpMcp {
+        id: u64,
+        servers: serde_json::Value,
+        #[serde(default)]
+        editor_read: bool,
+    },
+
+    #[serde(rename = "acp_file_content")]
+    AcpFileContent {
+        id: u64,
+        request_id: String,
+        content: Option<String>,
+        error: Option<String>,
+    },
+
+    #[serde(rename = "get_acp_history")]
+    GetAcpHistory { id: u64 },
+
     /// Get only provider/model metadata and available models.
     #[serde(rename = "get_model_catalog")]
     GetModelCatalog {
@@ -811,6 +831,19 @@ pub enum ServerEvent {
     #[serde(rename = "tool_exec")]
     ToolExec { id: String, name: String },
 
+    #[serde(rename = "acp_read_file")]
+    AcpReadFile { request_id: String, path: String },
+
+    #[serde(rename = "acp_history")]
+    AcpHistory {
+        id: u64,
+        messages: Vec<HistoryMessage>,
+    },
+
+    /// Bounded live output snapshot (replaces the previous snapshot).
+    #[serde(rename = "tool_output")]
+    ToolOutput { id: String, output: String },
+
     /// Tool execution completed
     #[serde(rename = "tool_done")]
     ToolDone {
@@ -1305,7 +1338,9 @@ pub enum ServerEvent {
 
     /// Usage delta for a route, independent of catalog availability or Agent locks.
     #[serde(rename = "model_usage_updated")]
-    ModelUsageUpdated { route: jcode_provider_core::ModelRoute },
+    ModelUsageUpdated {
+        route: jcode_provider_core::ModelRoute,
+    },
 
     /// Available models updated (pushed after auth changes)
     #[serde(rename = "available_models_updated")]

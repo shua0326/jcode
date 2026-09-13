@@ -184,3 +184,122 @@ async fn assign_task_to_client_attached_session_skips_server_side_run() {
         assert_eq!(members[worker].status, "ready");
     }
 }
+
+#[tokio::test]
+async fn acp_headless_assignment_uses_runner_without_duplicate_interrupt() {
+    let (_env, _runtime) = RuntimeEnvGuard::new();
+    let swarm_id = "swarm-client-attached";
+    let requester = "coord";
+    let worker = "worker-attached";
+    let (client_tx, mut client_rx) = mpsc::unbounded_channel();
+
+    // The worker has a live server-side agent AND a live client connection:
+    // the agent exists, so the only reason to skip the server-side run is the
+    // client attachment.
+    let worker_agent = test_agent().await;
+    let sessions = Arc::new(RwLock::new(HashMap::from([(
+        worker.to_string(),
+        Arc::clone(&worker_agent),
+    )])));
+    let soft_interrupt_queues = Arc::new(RwLock::new(HashMap::new()));
+
+    let client_connections = Arc::new(RwLock::new(HashMap::new()));
+    let worker_guard = worker_agent.lock().await;
+
+    let swarm_members = Arc::new(RwLock::new(HashMap::from([
+        (requester.to_string(), {
+            let mut member = member(requester, swarm_id, "ready");
+            member.role = "coordinator".to_string();
+            member
+        }),
+        // Owned visible worker: drivable for auto-pick, but client-attached.
+        (
+            worker.to_string(),
+            owned_member(worker, swarm_id, "ready", requester),
+        ),
+    ])));
+    let swarms_by_id = Arc::new(RwLock::new(HashMap::from([(
+        swarm_id.to_string(),
+        HashSet::from([requester.to_string(), worker.to_string()]),
+    )])));
+    let swarm_plans = Arc::new(RwLock::new(HashMap::from([(
+        swarm_id.to_string(),
+        VersionedPlan {
+            items: vec![plan_item("solo", "queued", "high", &[])],
+            version: 1,
+            participants: HashSet::from([requester.to_string(), worker.to_string()]),
+            task_progress: HashMap::new(),
+            mode: "light".to_string(),
+            node_meta: HashMap::new(),
+        },
+    )])));
+    let swarm_coordinators = Arc::new(RwLock::new(HashMap::from([(
+        swarm_id.to_string(),
+        requester.to_string(),
+    )])));
+    let event_history = Arc::new(RwLock::new(VecDeque::new()));
+    let event_counter = Arc::new(AtomicU64::new(1));
+    let (swarm_event_tx, _swarm_event_rx) = broadcast::channel(32);
+    let mutation_runtime = SwarmMutationRuntime::default();
+
+    handle_comm_assign_task(
+        91,
+        requester.to_string(),
+        Some(worker.to_string()),
+        Some("solo".to_string()),
+        None,
+        &client_tx,
+        &sessions,
+        &soft_interrupt_queues,
+        &client_connections,
+        &swarm_members,
+        &swarms_by_id,
+        &swarm_plans,
+        &swarm_coordinators,
+        &event_history,
+        &event_counter,
+        &swarm_event_tx,
+        &mutation_runtime,
+    )
+    .await;
+
+    match client_rx.recv().await.expect("response") {
+        ServerEvent::CommAssignTaskResponse {
+            id,
+            task_id,
+            target_session,
+        } => {
+            assert_eq!(id, 91);
+            assert_eq!(task_id, "solo");
+            assert_eq!(target_session, worker);
+        }
+        other => panic!("expected CommAssignTaskResponse, got {other:?}"),
+    }
+
+    // Give any (incorrectly) spawned server-side run a chance to flip state.
+    tokio::time::sleep(Duration::from_millis(50)).await;
+
+    {
+        let plans = swarm_plans.read().await;
+        let item = &plans[swarm_id].items[0];
+        assert_eq!(
+            item.status, "running",
+            "headless assignment must start exactly one runner"
+        );
+        assert_eq!(item.assigned_to.as_deref(), Some(worker));
+    }
+
+    // The assignment was handed to the live client as a soft interrupt.
+    assert!(
+        !worker_guard.has_soft_interrupts(),
+        "headless runner must receive the assignment without a second soft interrupt"
+    );
+
+    assert!(
+        soft_interrupt_queues
+            .read()
+            .await
+            .get(worker)
+            .is_none_or(|queue| queue.lock().unwrap().is_empty())
+    );
+}

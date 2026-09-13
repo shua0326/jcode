@@ -393,6 +393,12 @@ pub enum SessionUpdateStatus {
 
 #[derive(Clone, Debug)]
 pub enum BusEvent {
+    /// Bounded output snapshot for an executing shell tool.
+    ToolOutput {
+        session_id: String,
+        tool_call_id: String,
+        output: String,
+    },
     ToolUpdated(ToolEvent),
     TodoUpdated(TodoEvent),
     SubagentStatus(SubagentStatus),
