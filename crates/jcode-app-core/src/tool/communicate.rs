@@ -5,13 +5,14 @@ use crate::background::TaskResult;
 use crate::plan::PlanItem;
 use crate::protocol::{
     AgentInfo, AgentStatusSnapshot, AwaitedMemberStatus, CommDeliveryMode, ContextEntry,
-    HistoryMessage, PlanGraphStatus, Request, ServerEvent, SwarmChannelInfo, TaskGraphNodeSpec,
-    ToolCallSummary, comm_cleanup_candidate_session_ids, default_comm_await_target_statuses,
-    default_comm_cleanup_target_statuses, default_comm_run_await_statuses,
-    format_comm_awaited_members_with_reports, format_comm_channels, format_comm_context_entries,
-    format_comm_context_history, format_comm_members, format_comm_plan_followup,
-    format_comm_plan_status, format_comm_status_snapshot, format_comm_tool_summary,
-    latest_assistant_comm_report, resolve_optional_comm_target_session,
+    HistoryMessage, MAX_AWAITED_REPORT_TOTAL_CHARS, PlanGraphStatus, Request, ServerEvent,
+    SwarmChannelInfo, TaskGraphNodeSpec, ToolCallSummary, comm_cleanup_candidate_session_ids,
+    default_comm_await_target_statuses, default_comm_cleanup_target_statuses,
+    default_comm_run_await_statuses, format_comm_awaited_members_with_reports,
+    format_comm_channels, format_comm_context_entries, format_comm_context_history,
+    format_comm_members, format_comm_plan_followup, format_comm_plan_status,
+    format_comm_status_snapshot, format_comm_tool_summary, latest_assistant_comm_report,
+    resolve_optional_comm_target_session,
 };
 use anyhow::Result;
 use async_trait::async_trait;
@@ -1675,7 +1676,13 @@ fn format_awaited_members(
     summary: &str,
     members: &[AwaitedMemberStatus],
 ) -> ToolOutput {
-    format_awaited_members_with_reports(completed, summary, members, &HashMap::new())
+    format_awaited_members_with_reports(
+        completed,
+        summary,
+        members,
+        &HashMap::new(),
+        Some(MAX_AWAITED_REPORT_TOTAL_CHARS),
+    )
 }
 
 fn latest_assistant_report(messages: &[HistoryMessage]) -> Option<String> {
@@ -1691,9 +1698,14 @@ fn format_awaited_members_with_reports(
     summary: &str,
     members: &[AwaitedMemberStatus],
     reports: &HashMap<String, String>,
+    report_budget: Option<usize>,
 ) -> ToolOutput {
     ToolOutput::new(format_comm_awaited_members_with_reports(
-        completed, summary, members, reports,
+        completed,
+        summary,
+        members,
+        reports,
+        report_budget,
     ))
 }
 
@@ -1702,7 +1714,12 @@ async fn fetch_awaited_member_reports(
     members: &[AwaitedMemberStatus],
 ) -> HashMap<String, String> {
     let mut reports = HashMap::new();
-    for member in members.iter().filter(|member| member.done) {
+    // The server already puts each reported member's stored report on the
+    // status payload, so fetching history for those members is a redundant
+    // round-trip that also transfers the member's whole conversation. Only
+    // members that finished without their report on the payload need the
+    // backfill.
+    for member in members_needing_report_backfill(members) {
         let request = Request::CommReadContext {
             id: REQUEST_ID,
             session_id: ctx.session_id.clone(),
@@ -1723,6 +1740,24 @@ async fn fetch_awaited_member_reports(
         }
     }
     reports
+}
+
+/// Members whose completion report is still missing from the status payload.
+fn members_needing_report_backfill(
+    members: &[AwaitedMemberStatus],
+) -> impl Iterator<Item = &AwaitedMemberStatus> {
+    members
+        .iter()
+        .filter(|member| member.done && member.completion_report.is_none())
+}
+
+/// Report rendering budget for an await result. `full_reports` drops the bound
+/// so a coordinator can pull complete text after a trimmed digest.
+fn await_report_budget(full_reports: Option<bool>) -> Option<usize> {
+    match full_reports {
+        Some(true) => None,
+        _ => Some(MAX_AWAITED_REPORT_TOTAL_CHARS),
+    }
 }
 
 fn default_await_target_statuses() -> Vec<String> {
@@ -1868,6 +1903,10 @@ struct CommunicateInput {
     wake: Option<bool>,
     #[serde(default)]
     background: Option<bool>,
+    /// Return each member's complete stored completion report instead of the
+    /// budgeted digest. Use after a trimmed await result.
+    #[serde(default)]
+    full_reports: Option<bool>,
     #[serde(default)]
     notify: Option<bool>,
     #[serde(default)]
@@ -2074,6 +2113,10 @@ impl Tool for CommunicateTool {
                 "session_ids": {
                     "type": "array",
                     "items": {"type": "string"}
+                },
+                "full_reports": {
+                    "type": "boolean",
+                    "description": "For await_members: return each done member's complete stored report. Default false returns the budgeted digest; set true after a trimmed result needs full text."
                 },
                 "mode": {
                     "type": "string",
@@ -3365,7 +3408,11 @@ impl Tool for CommunicateTool {
                         }
                         let reports = fetch_awaited_member_reports(&ctx, &members).await;
                         Ok(format_awaited_members_with_reports(
-                            completed, &summary, &members, &reports,
+                            completed,
+                            &summary,
+                            &members,
+                            &reports,
+                            await_report_budget(params.full_reports),
                         ))
                     }
                     Ok(response) => {

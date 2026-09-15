@@ -580,11 +580,32 @@ pub fn resolve_optional_comm_target_session(
     }
 }
 
+/// Total character budget for every completion report body rendered into one
+/// aggregated await result. Without it, payload size scales with member count:
+/// eight maximum-length reports inject roughly 32k chars into a single
+/// coordinator turn, on top of the per-member notices already delivered.
+pub const MAX_AWAITED_REPORT_TOTAL_CHARS: usize = 8000;
+
+/// Largest share one report may take from that budget. Individual reports are
+/// already capped at `MAX_SWARM_COMPLETION_REPORT_CHARS`, so this only binds a
+/// lone or two-member swarm.
+pub const MAX_AWAITED_REPORT_SHARE_CHARS: usize = 4000;
+
+/// Smallest share, so a wide swarm still shows a usable excerpt instead of a
+/// bare elision marker.
+pub const MIN_AWAITED_REPORT_SHARE_CHARS: usize = 400;
+
+/// Portion of a trimmed report reserved for its tail. Structured completion
+/// reports append `Validation:` and `Follow-ups/blockers:` sections there, and
+/// a head-only cut would drop the parts a coordinator acts on.
+const TRIMMED_REPORT_TAIL_PERCENT: usize = 40;
+
 pub fn format_comm_awaited_members_with_reports(
     completed: bool,
     summary: &str,
     members: &[AwaitedMemberStatus],
     reports: &HashMap<String, String>,
+    report_budget: Option<usize>,
 ) -> String {
     // An any-mode wait can complete while some members are still pending, so
     // only claim "All members done" when every member actually matched.
@@ -629,20 +650,78 @@ pub fn format_comm_awaited_members_with_reports(
             members.iter().map(|member| member.friendly_name.as_deref()),
         );
         output.push_str("\nCompletion reports:\n");
+        // A per-report cap still scales with member count: eight maximum-length
+        // reports would inject ~32k chars into one coordinator turn. The total
+        // budget keeps a wide swarm bounded while the fair share keeps every
+        // member represented.
+        let share = report_budget.map(|budget| {
+            (budget / report_members.len().max(1)).clamp(
+                MIN_AWAITED_REPORT_SHARE_CHARS,
+                MAX_AWAITED_REPORT_SHARE_CHARS,
+            )
+        });
+        let mut trimmed_ids: Vec<&str> = Vec::new();
         for (member, report) in report_members {
             let name = comm_display_friendly_name(
                 member.friendly_name.as_deref(),
                 &member.session_id,
                 &duplicate_names,
             );
+            output.push_str(&format!("\n--- {} ({}) ---\n", name, member.status));
+            match share {
+                None => {
+                    output.push_str(report.trim());
+                    output.push('\n');
+                }
+                Some(share) => {
+                    let (rendered, omitted) = elide_report_middle(report, share);
+                    if omitted > 0 {
+                        trimmed_ids.push(&member.session_id);
+                    }
+                    output.push_str(&rendered);
+                    output.push('\n');
+                }
+            }
+        }
+        if !trimmed_ids.is_empty() {
+            let ids = trimmed_ids
+                .iter()
+                .map(|id| format!("\"{id}\""))
+                .collect::<Vec<_>>()
+                .join(",");
             output.push_str(&format!(
-                "\n--- {} ({}) ---\n{}\n",
-                name, member.status, report
+                "\n[Reports trimmed to hold the swarm output budget. Full text: \
+                 swarm action=await_members session_ids=[{ids}] full_reports=true]\n"
             ));
         }
     }
 
     output
+}
+
+/// Keep the head and the tail of an over-budget report.
+///
+/// Structured completion reports append `Validation:` and `Follow-ups/blockers:`
+/// sections, so a head-only cut drops the parts a coordinator acts on. The tail
+/// share preserves them. Returns the rendered text and the number of omitted
+/// characters (0 when the report fit).
+fn elide_report_middle(report: &str, share: usize) -> (String, usize) {
+    let trimmed = report.trim();
+    let total = trimmed.chars().count();
+    if total <= share {
+        return (trimmed.to_string(), 0);
+    }
+    // The elision marker is counted against the share so the rendered report
+    // cannot grow past `share` plus the marker's own length.
+    let marker = format!("[... {} chars omitted ...]", total - share);
+    let body_budget = share.saturating_sub(marker.chars().count());
+    let tail_chars = body_budget * TRIMMED_REPORT_TAIL_PERCENT / 100;
+    let head_chars = body_budget.saturating_sub(tail_chars);
+    let head: String = trimmed.chars().take(head_chars).collect();
+    let tail: String = trimmed.chars().skip(total - tail_chars).collect();
+    let omitted = total.saturating_sub(head_chars + tail_chars);
+    let rendered = format!("{}\n{}\n{}", head.trim_end(), marker, tail.trim_start());
+    (rendered, omitted)
 }
 
 pub fn format_comm_channels(channels: &[SwarmChannelInfo]) -> String {

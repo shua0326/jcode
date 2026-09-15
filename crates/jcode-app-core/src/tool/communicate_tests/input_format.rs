@@ -435,3 +435,81 @@ fn format_status_snapshot_includes_activity_and_metadata() {
     );
     assert!(output.output.contains("Files: src/server/comm_sync.rs"));
 }
+
+#[test]
+fn await_report_budget_defaults_to_the_shared_cap() {
+    use crate::protocol::MAX_AWAITED_REPORT_TOTAL_CHARS;
+    assert_eq!(
+        await_report_budget(None),
+        Some(MAX_AWAITED_REPORT_TOTAL_CHARS)
+    );
+    assert_eq!(
+        await_report_budget(Some(false)),
+        Some(MAX_AWAITED_REPORT_TOTAL_CHARS)
+    );
+    assert_eq!(
+        await_report_budget(Some(true)),
+        None,
+        "full_reports must lift the rendering budget"
+    );
+}
+
+#[test]
+fn report_backfill_only_covers_members_missing_a_report() {
+    let members = vec![
+        AwaitedMemberStatus {
+            session_id: "with-report".to_string(),
+            friendly_name: Some("fox".to_string()),
+            status: "ready".to_string(),
+            done: true,
+            completion_report: Some("done: all tests pass".to_string()),
+        },
+        AwaitedMemberStatus {
+            session_id: "done-without-report".to_string(),
+            friendly_name: Some("wolf".to_string()),
+            status: "ready".to_string(),
+            done: true,
+            completion_report: None,
+        },
+        AwaitedMemberStatus {
+            session_id: "still-running".to_string(),
+            friendly_name: Some("bear".to_string()),
+            status: "running".to_string(),
+            done: false,
+            completion_report: None,
+        },
+    ];
+
+    let backfill: Vec<&str> = members_needing_report_backfill(&members)
+        .map(|member| member.session_id.as_str())
+        .collect();
+    assert_eq!(
+        backfill,
+        vec!["done-without-report"],
+        "members that already carry a report or are still running must not be re-fetched"
+    );
+}
+
+#[test]
+fn awaited_members_digest_points_at_the_full_report_escape_hatch() {
+    let report = "R".repeat(crate::protocol::MAX_AWAITED_REPORT_SHARE_CHARS);
+    let output = format_awaited_members_with_reports(
+        true,
+        "All members done",
+        &[AwaitedMemberStatus {
+            session_id: "session_shark_1234567890_aaaaaaaaaaaa0001".to_string(),
+            friendly_name: Some("shark".to_string()),
+            status: "ready".to_string(),
+            done: true,
+            completion_report: Some(report),
+        }],
+        &HashMap::new(),
+        Some(800),
+    );
+    assert!(output.output.contains("chars omitted"));
+    assert!(
+        output.output.contains("full_reports=true"),
+        "trimmed output must name the retrieval path: {}",
+        output.output
+    );
+}

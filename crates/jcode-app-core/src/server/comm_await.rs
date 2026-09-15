@@ -4,7 +4,10 @@ use super::await_members_state::{
 };
 use super::{AwaitMembersRuntime, SwarmEvent, SwarmMember};
 use crate::bus::{Bus, BusEvent, SwarmAwaitCompleted, UiActivity};
-use crate::protocol::{AwaitedMemberStatus, ServerEvent, format_comm_awaited_members_with_reports};
+use crate::protocol::{
+    AwaitedMemberStatus, MAX_AWAITED_REPORT_TOTAL_CHARS, ServerEvent,
+    format_comm_awaited_members_with_reports,
+};
 use std::collections::{HashMap, HashSet};
 use std::sync::Arc;
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
@@ -190,13 +193,22 @@ pub(super) async fn respond_to_waiters(
 /// member-status + completion-report rendering as the blocking tool result so
 /// the agent sees consistent output whether it waited inline or in the
 /// background.
-fn background_completion_notification(
+pub(super) fn background_completion_notification(
     completed: bool,
     summary: &str,
     members: &[AwaitedMemberStatus],
 ) -> String {
     let reports = HashMap::new();
-    let body = format_comm_awaited_members_with_reports(completed, summary, members, &reports);
+    // The notification lands in the coordinator's context as a turn prompt, so
+    // it uses the same bounded rendering as the tool result. The coordinator
+    // can pull full text with `await_members ... full_reports=true`.
+    let body = format_comm_awaited_members_with_reports(
+        completed,
+        summary,
+        members,
+        &reports,
+        Some(MAX_AWAITED_REPORT_TOTAL_CHARS),
+    );
     format!("🐝 **Swarm await finished**\n\n{}", body)
 }
 
