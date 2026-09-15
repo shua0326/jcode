@@ -1099,6 +1099,32 @@ impl AcpRuntime {
                         }
                         let _ = runtime.write_config_option_update(&active).await;
                     }
+                    ServerEvent::Notification {
+                        from_session,
+                        from_name,
+                        notification_type,
+                        message,
+                    } => {
+                        // Rendered whether or not a turn is running: an idle
+                        // session has no other channel for a coordinator's
+                        // assignment, report or file conflict.
+                        let text = notification_chunk_text(
+                            &from_session,
+                            from_name.as_deref(),
+                            &notification_type,
+                            &message,
+                        );
+                        if runtime
+                            .write_notification(
+                                "session/update",
+                                json!({"sessionId":active.session_id,"update":agent_message_chunk(text)}),
+                            )
+                            .await
+                            .is_err()
+                        {
+                            return;
+                        }
+                    }
                     other => {
                         // Unsolicited idle events must not fill a queue nobody is consuming.
                         if active.prompt_running.load(Ordering::SeqCst)
@@ -3059,6 +3085,34 @@ fn agent_message_chunk(text: String) -> Value {
     })
 }
 
+/// One display line for inter-agent traffic. Assignments, reports, channel
+/// posts and file conflicts are the only way a coordinator reaches an idle
+/// session, so they belong in the transcript rather than being dropped.
+fn notification_chunk_text(
+    from_session: &str,
+    from_name: Option<&str>,
+    notification_type: &crate::protocol::NotificationType,
+    message: &str,
+) -> String {
+    let sender = from_name.unwrap_or(from_session);
+    let label = match notification_type {
+        crate::protocol::NotificationType::Message { scope, channel, .. } => {
+            match (scope.as_deref(), channel.as_deref()) {
+                (Some("channel"), Some(channel)) => format!("#{channel} from {sender}"),
+                (Some("broadcast"), _) => format!("Broadcast from {sender}"),
+                _ => format!("Message from {sender}"),
+            }
+        }
+        crate::protocol::NotificationType::FileConflict { path, .. } => {
+            format!("File conflict on {path} from {sender}")
+        }
+        crate::protocol::NotificationType::SharedContext { key, .. } => {
+            format!("Shared context `{key}` from {sender}")
+        }
+    };
+    format!("{label}: {message}")
+}
+
 /// Upper bound for a file preview shipped to an ACP client. The client renders
 /// `oldText`/`newText` as the whole file, so larger paths are skipped instead of
 /// sending megabytes of JSON per edit.
@@ -4027,5 +4081,52 @@ mod tests {
             Some(ServerEvent::TextDelta { text }) => assert_eq!(text, "event-588"),
             other => panic!("expected the oldest surviving TextDelta, got {other:?}"),
         }
+    }
+
+    #[test]
+    fn inter_agent_notifications_render_with_their_sender_and_scope() {
+        use crate::protocol::NotificationType;
+        assert_eq!(
+            notification_chunk_text(
+                "session-abc",
+                Some("Researcher"),
+                &NotificationType::Message {
+                    scope: Some("dm".into()),
+                    channel: None,
+                    tldr: None,
+                },
+                "please verify section 3"
+            ),
+            "Message from Researcher: please verify section 3"
+        );
+        // Falls back to the session id when no friendly name was reported.
+        assert_eq!(
+            notification_chunk_text(
+                "session-abc",
+                None,
+                &NotificationType::Message {
+                    scope: Some("channel".into()),
+                    channel: Some("parser".into()),
+                    tldr: None,
+                },
+                "landed the fix"
+            ),
+            "#parser from session-abc: landed the fix"
+        );
+        assert_eq!(
+            notification_chunk_text(
+                "session-abc",
+                Some("Writer"),
+                &NotificationType::FileConflict {
+                    path: "src/lib.rs".into(),
+                    operation: "wrote".into(),
+                    intent: None,
+                    summary: None,
+                    detail: None,
+                },
+                "another agent edited this file"
+            ),
+            "File conflict on src/lib.rs from Writer: another agent edited this file"
+        );
     }
 }
