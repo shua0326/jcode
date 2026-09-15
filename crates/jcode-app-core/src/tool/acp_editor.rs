@@ -11,6 +11,13 @@ use std::{
 use tokio::sync::{mpsc, oneshot};
 
 type Reply = std::result::Result<Option<String>, String>;
+
+/// Server-name prefix for MCP servers forwarded by an ACP client, so they can be
+/// told apart from user-configured servers in the same registry.
+pub(crate) const MCP_SERVER_PREFIX: &str = "acp_zed_";
+/// Registered tool-name prefix for those forwarded servers.
+pub(crate) const MCP_TOOL_PREFIX: &str = "mcp__acp_zed_";
+
 #[derive(Default)]
 struct State {
     clients: HashMap<String, mpsc::UnboundedSender<ServerEvent>>,

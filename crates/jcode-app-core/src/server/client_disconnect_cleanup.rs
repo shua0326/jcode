@@ -143,6 +143,28 @@ pub(super) async fn cleanup_client_connection(
     )
     .await;
 
+    // An ACP attachment owns two session-scoped resources that must not outlive
+    // the client connection. The unsaved-buffer guard keeps a reply channel that
+    // is now closed, so leaving it installed would reject every later edit with
+    // "Editor did not respond"; clear it first so a retained turn keeps working.
+    crate::tool::acp_editor::install(client_session_id, None);
+    // Zed-supplied MCP servers hold live stdio children. Drop them once the
+    // session has no running turn that could still call one of their tools.
+    if !crate::turn_cancel_registry::has_active_turn(client_session_id) {
+        let registry = {
+            let sessions = sessions.read().await;
+            sessions
+                .get(client_session_id)
+                .cloned()
+                .and_then(|agent| agent.try_lock().ok().map(|agent| agent.registry()))
+        };
+        if let Some(registry) = registry {
+            registry
+                .unregister_prefix(crate::tool::acp_editor::MCP_TOOL_PREFIX)
+                .await;
+        }
+    }
+
     if allow_reconnect {
         // Empty roots intentionally have no snapshot. A replacement UI/SDK
         // connection needs a bounded opportunity to reclaim the live Agent,

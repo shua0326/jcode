@@ -1804,7 +1804,7 @@ pub(super) async fn handle_client(
                 let config: Result<crate::mcp::McpConfig, _> = serde_json::from_value(servers);
                 let result = async {
                     let config = config.map_err(|e| anyhow::anyhow!("Invalid ACP MCP configuration: {e}"))?;
-                    if config.servers.keys().any(|name| !name.starts_with("acp_zed_")) || config.servers.values().any(|server| !server.is_stdio() || server.shared) {
+                    if config.servers.keys().any(|name| !name.starts_with(crate::tool::acp_editor::MCP_SERVER_PREFIX)) || config.servers.values().any(|server| !server.is_stdio() || server.shared) {
                         anyhow::bail!("ACP MCP requires private, prefixed stdio servers");
                     }
                     let manager = Arc::new(tokio::sync::RwLock::new(crate::mcp::McpManager::with_config(config)));
@@ -1815,7 +1815,7 @@ pub(super) async fn handle_client(
                     }
                     let tools = crate::mcp::create_mcp_tools(manager).await;
                     let registry = agent.lock().await.registry();
-                    registry.unregister_prefix("mcp__acp_zed_").await;
+                    registry.unregister_prefix(crate::tool::acp_editor::MCP_TOOL_PREFIX).await;
                     for (name, tool) in tools { registry.register(name, tool).await; }
                     Ok::<(), anyhow::Error>(())
                 }.await;
