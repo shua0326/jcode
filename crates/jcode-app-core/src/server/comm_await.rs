@@ -113,6 +113,32 @@ pub(super) fn mode_satisfied(member_statuses: &[AwaitedMemberStatus], mode: Opti
     }
 }
 
+/// A watched member that can no longer reach the requested status.
+pub(super) fn member_stopped(status: &AwaitedMemberStatus) -> bool {
+    !status.done && matches!(status.status.as_str(), "failed" | "stopped" | "cancelled")
+}
+
+/// True when no watched member can still reach the requested status, so the
+/// wait itself is unsatisfiable rather than merely stalled.
+///
+/// A wait that is already satisfied is never a dead end. `any` can still
+/// complete while one live member remains, so a single stopped sibling is not
+/// fatal there. `all` needs every member, so one stopped member already ends it.
+pub(super) fn wait_is_dead_end(
+    member_statuses: &[AwaitedMemberStatus],
+    mode: Option<&str>,
+) -> bool {
+    if mode_satisfied(member_statuses, mode) {
+        return false;
+    }
+    match completion_mode(mode) {
+        "any" => member_statuses
+            .iter()
+            .all(|status| status.done || member_stopped(status)),
+        _ => member_statuses.iter().any(member_stopped),
+    }
+}
+
 pub(super) fn mode_summary(member_statuses: &[AwaitedMemberStatus], mode: Option<&str>) -> String {
     match completion_mode(mode) {
         "any" => {
@@ -248,18 +274,15 @@ pub(super) async fn spawn_or_resume_await_members(
                 return;
             }
 
-            let current = refresh_pending_state(&state).unwrap_or_else(|| state.clone());
-            if current.background
-                && current.wake
-                && member_statuses.iter().any(|m| {
-                    !m.done && matches!(m.status.as_str(), "failed" | "stopped" | "cancelled")
-                })
-            {
-                let summary = "A watched worker stopped before reaching the requested status; inspect the attached member statuses.".to_string();
+            // A satisfied wait always wins over the dead-end check: under
+            // `mode: "any"` a stopped sibling must not cancel the remaining
+            // members that can still reach the requested status.
+            if mode_satisfied(&member_statuses, mode.as_deref()) {
+                let summary = mode_summary(&member_statuses, mode.as_deref());
                 finalize_await(
                     &await_members_runtime,
                     &state,
-                    false,
+                    true,
                     member_statuses,
                     summary,
                 )
@@ -267,12 +290,16 @@ pub(super) async fn spawn_or_resume_await_members(
                 return;
             }
 
-            if mode_satisfied(&member_statuses, mode.as_deref()) {
-                let summary = mode_summary(&member_statuses, mode.as_deref());
+            let current = refresh_pending_state(&state).unwrap_or_else(|| state.clone());
+            if current.background
+                && current.wake
+                && wait_is_dead_end(&member_statuses, mode.as_deref())
+            {
+                let summary = "No watched worker can still reach the requested status; inspect the attached member statuses.".to_string();
                 finalize_await(
                     &await_members_runtime,
                     &state,
-                    true,
+                    false,
                     member_statuses,
                     summary,
                 )
@@ -296,7 +323,14 @@ pub(super) async fn spawn_or_resume_await_members(
 
             tokio::select! {
                 _ = tokio::time::sleep_until(deadline) => {
-                    let mut latest = refresh_pending_state(&state).unwrap_or_else(|| state.clone());
+                    // Extend only a watch that is still pending. Persisting a
+                    // stale copy back over a state that was finalized or removed
+                    // elsewhere would resurrect it and could double-fire the
+                    // promised notify/wake.
+                    let Some(mut latest) = refresh_pending_state(&state) else {
+                        await_members_runtime.clear_active(&key).await;
+                        return;
+                    };
                     if latest.background && latest.wake {
                         // No LLM call for unchanged worker state. Keep the persisted
                         // watch alive so completion can still wake the coordinator.
