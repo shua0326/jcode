@@ -604,7 +604,6 @@ fn direct_deepseek_profile_omits_image_url_parts() {
         timestamp: None,
         tool_duration_ms: None,
     }];
-
     let rt = tokio::runtime::Builder::new_current_thread()
         .enable_all()
         .build()
@@ -1584,6 +1583,107 @@ fn direct_zai_profile_exposes_openai_reasoning_effort_ladder() {
         .set_reasoning_effort("xhigh")
         .expect("Z.AI Coding Plan should accept xhigh effort");
     assert_eq!(provider.reasoning_effort().as_deref(), Some("xhigh"));
+}
+
+#[test]
+fn opencode_go_muse_exposes_documented_reasoning_efforts() {
+    let provider = OpenRouterProvider {
+        model: Arc::new(RwLock::new("muse-spark-1.3-contributor".to_string())),
+        profile_id: Some("opencode-go".to_string()),
+        supports_provider_features: false,
+        ..make_custom_compatible_provider()
+    };
+
+    assert_eq!(
+        provider.available_efforts(),
+        vec![
+            "none",
+            "minimal",
+            "low",
+            "medium",
+            "high",
+            "xhigh",
+            "swarm",
+            "swarm-deep"
+        ]
+    );
+    provider
+        .set_reasoning_effort("xhigh")
+        .expect("Muse should accept its strongest advertised effort");
+    assert_eq!(provider.reasoning_effort().as_deref(), Some("xhigh"));
+    assert!(provider.set_reasoning_effort("max").is_err());
+}
+
+#[test]
+fn opencode_go_muse_request_uses_responses_api() {
+    let (api_base, request_rx) = spawn_single_response_chat_server();
+    let provider = OpenRouterProvider {
+        api_base,
+        model: Arc::new(RwLock::new("muse-spark-1.3-contributor".to_string())),
+        profile_id: Some("opencode-go".to_string()),
+        supports_provider_features: false,
+        supports_model_catalog: false,
+        ..make_custom_compatible_provider()
+    };
+    provider
+        .set_reasoning_effort("high")
+        .expect("Muse should accept high effort");
+    let messages = vec![Message {
+        role: Role::User,
+        content: vec![ContentBlock::Text {
+            text: "hello".to_string(),
+            cache_control: None,
+        }],
+        timestamp: None,
+        tool_duration_ms: None,
+    }];
+    let tools = vec![ToolDefinition {
+        name: "read".to_string(),
+        description: "Read a file".to_string(),
+        input_schema: serde_json::json!({
+            "type": "object",
+            "properties": {"path": {"type": "string"}},
+            "required": ["path"]
+        }),
+    }];
+
+    let rt = tokio::runtime::Builder::new_current_thread()
+        .enable_all()
+        .build()
+        .expect("runtime");
+    rt.block_on(async {
+        let mut stream = provider
+            .complete(&messages, &tools, "system prompt", None)
+            .await
+            .expect("fake Responses request should start");
+        while let Some(event) = stream.next().await {
+            event.expect("Responses stream event should parse");
+        }
+    });
+
+    let request = request_rx
+        .recv_timeout(Duration::from_secs(2))
+        .expect("capture fake provider request");
+    assert!(
+        request.starts_with("POST /v1/responses "),
+        "Muse should use the Responses endpoint: {request}"
+    );
+    let body = parse_captured_request_body(&request);
+    assert!(
+        body.get("input")
+            .and_then(|value| value.as_array())
+            .is_some()
+    );
+    assert!(body.get("messages").is_none());
+    assert_eq!(body["instructions"], "system prompt");
+    assert_eq!(body["reasoning"]["effort"], "high");
+    assert_eq!(body["tool_choice"], "auto");
+    assert_eq!(body["tools"][0]["type"], "function");
+    assert_eq!(body["tools"][0]["name"], "read");
+    assert_eq!(body["tools"][0]["parameters"]["type"], "object");
+    assert!(body["tools"][0].get("function").is_none());
+    assert!(body.get("reasoning_effort").is_none());
+    assert!(body.get("stream_options").is_none());
 }
 
 #[test]
@@ -3066,6 +3166,7 @@ fn midstream_transport_fault_emits_retry_rollback_before_replay() {
             },
             false,
             new_conversation_id(),
+            OpenAiCompatibleWireApi::ChatCompletions,
             request,
             tx,
             Arc::new(Mutex::new(None)),
@@ -3577,6 +3678,7 @@ fn captured_request_for_host(host: &str, conversation_id: &str) -> String {
             },
             false,
             conversation_id.to_string(),
+            OpenAiCompatibleWireApi::ChatCompletions,
             serde_json::json!({"model": "m", "messages": [], "stream": true}),
             tx,
             Arc::new(Mutex::new(None)),

@@ -461,6 +461,28 @@ fn apply_opencode_session_header(
 
 pub(crate) const OPENCODE_SESSION_HEADER: &str = "x-opencode-session";
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum OpenAiCompatibleWireApi {
+    ChatCompletions,
+    Responses,
+}
+
+impl OpenAiCompatibleWireApi {
+    pub(crate) fn path(self) -> &'static str {
+        match self {
+            Self::ChatCompletions => "chat/completions",
+            Self::Responses => "responses",
+        }
+    }
+
+    pub(crate) fn log_name(self) -> &'static str {
+        match self {
+            Self::ChatCompletions => "chat_completions",
+            Self::Responses => "responses",
+        }
+    }
+}
+
 #[derive(Debug, Clone)]
 enum ProviderAuth {
     AuthorizationBearer {
@@ -943,6 +965,41 @@ pub struct OpenRouterProvider {
 }
 
 impl OpenRouterProvider {
+    fn is_opencode_go_profile(&self) -> bool {
+        if self
+            .profile_id
+            .as_deref()
+            .is_some_and(|id| id.eq_ignore_ascii_case("opencode-go"))
+        {
+            return true;
+        }
+
+        let Ok(url) = reqwest::Url::parse(&self.api_base) else {
+            return false;
+        };
+        matches!(url.host_str(), Some("opencode.ai"))
+            && url.path().trim_end_matches('/').ends_with("/zen/go/v1")
+    }
+
+    fn model_is_muse_spark_family(model: &str) -> bool {
+        model.trim().to_ascii_lowercase().starts_with("muse-spark-")
+    }
+
+    fn wire_api_for_model(&self, model: &str) -> OpenAiCompatibleWireApi {
+        if self.is_opencode_go_profile() && Self::model_is_muse_spark_family(model) {
+            OpenAiCompatibleWireApi::Responses
+        } else {
+            OpenAiCompatibleWireApi::ChatCompletions
+        }
+    }
+
+    fn supports_muse_spark_reasoning_effort(&self) -> bool {
+        self.is_opencode_go_profile()
+            && Self::model_is_muse_spark_family(&self.model_snapshot())
+            && self.model_reasoning_support() != Some(false)
+            && self.reasoning_effort_support != Some(false)
+    }
+
     fn profile_supports_reasoning_effort(profile_id: Option<&str>) -> bool {
         matches!(profile_id, Some(id) if id.eq_ignore_ascii_case("deepseek"))
     }
@@ -1046,7 +1103,8 @@ impl OpenRouterProvider {
     }
 
     pub(crate) fn supports_any_reasoning_effort(&self) -> bool {
-        self.supports_deepseek_reasoning_effort()
+        self.supports_muse_spark_reasoning_effort()
+            || self.supports_deepseek_reasoning_effort()
             || self.supports_openai_reasoning_effort()
             || Self::profile_supports_unified_reasoning(
                 self.profile_id.as_deref(),
@@ -1055,7 +1113,9 @@ impl OpenRouterProvider {
     }
 
     pub(crate) fn normalize_reasoning_effort_for_self(&self, effort: &str) -> Option<String> {
-        if self.supports_deepseek_reasoning_effort() {
+        if self.supports_muse_spark_reasoning_effort() {
+            Self::normalize_muse_spark_reasoning_effort(effort)
+        } else if self.supports_deepseek_reasoning_effort() {
             Self::normalize_reasoning_effort(effort)
         } else if self.supports_openai_reasoning_effort() {
             Self::normalize_openai_reasoning_effort(effort)
@@ -1138,6 +1198,25 @@ impl OpenRouterProvider {
             other => {
                 jcode_base::logging::info(&format!(
                     "Warning: Ignoring unsupported OpenAI-compatible reasoning effort '{}'.",
+                    other
+                ));
+                None
+            }
+        }
+    }
+
+    fn normalize_muse_spark_reasoning_effort(raw: &str) -> Option<String> {
+        let value = raw.trim().to_ascii_lowercase();
+        if value.is_empty() {
+            return None;
+        }
+        match value.as_str() {
+            "none" | "minimal" | "low" | "medium" | "high" | "xhigh" | "swarm" | "swarm-deep" => {
+                Some(value)
+            }
+            other => {
+                jcode_base::logging::info(&format!(
+                    "Warning: Ignoring unsupported Muse Spark reasoning effort '{}'; expected none|minimal|low|medium|high|xhigh.",
                     other
                 ));
                 None

@@ -33,6 +33,7 @@ pub(super) async fn run_stream_with_retries(
     auth: ProviderAuth,
     send_openrouter_headers: bool,
     conversation_id: String,
+    wire_api: OpenAiCompatibleWireApi,
     request: Value,
     tx: mpsc::Sender<Result<StreamEvent>>,
     provider_pin: Arc<Mutex<Option<ProviderPin>>>,
@@ -94,6 +95,7 @@ pub(super) async fn run_stream_with_retries(
             auth.clone(),
             send_openrouter_headers,
             &conversation_id,
+            wire_api,
             request.clone(),
             attempt_tx,
             Arc::clone(&provider_pin),
@@ -163,6 +165,7 @@ async fn stream_response(
     auth: ProviderAuth,
     send_openrouter_headers: bool,
     conversation_id: &str,
+    wire_api: OpenAiCompatibleWireApi,
     request: Value,
     tx: mpsc::Sender<Result<StreamEvent>>,
     provider_pin: Arc<Mutex<Option<ProviderPin>>>,
@@ -177,7 +180,7 @@ async fn stream_response(
     let connect_start = std::time::Instant::now();
     let stream_idle_timeout = jcode_base::provider::stream_idle_timeout();
 
-    let url = format!("{}/chat/completions", api_base);
+    let url = format!("{}/{}", api_base, wire_api.path());
     let mut req = apply_kimi_coding_agent_headers(
         auth.apply(
             client
@@ -205,7 +208,8 @@ async fn stream_response(
     .with_context(|| {
         let hint = local_endpoint_troubleshooting_hint(&api_base, &model);
         format!(
-            "Failed to send OpenAI-compatible chat request\n  endpoint: {}\n  model: {}\n  auth: {}\n{}",
+            "Failed to send OpenAI-compatible {} request\n  endpoint: {}\n  model: {}\n  auth: {}\n{}",
+            wire_api.log_name(),
             url,
             model,
             auth.label(),
@@ -227,7 +231,8 @@ async fn stream_response(
         let hint = local_endpoint_troubleshooting_hint(&api_base, &model);
         return Err(jcode_provider_core::retry_after::error_with_retry_after(
             format!(
-                "OpenAI-compatible chat request failed\n  endpoint: {}\n  model: {}\n  auth: {}\n  status: {}\n  response: {}\n{}",
+                "OpenAI-compatible {} request failed\n  endpoint: {}\n  model: {}\n  auth: {}\n  status: {}\n  response: {}\n{}",
+                wire_api.log_name(),
                 url,
                 model,
                 auth.label(),
@@ -245,7 +250,17 @@ async fn stream_response(
         }))
         .await;
 
-    let mut stream = OpenRouterStream::new(response.bytes_stream(), model.clone(), provider_pin);
+    let byte_stream = response.bytes_stream();
+    let mut stream: EventStream = match wire_api {
+        OpenAiCompatibleWireApi::ChatCompletions => Box::pin(OpenRouterStream::new(
+            byte_stream,
+            model.clone(),
+            provider_pin,
+        )),
+        OpenAiCompatibleWireApi::Responses => Box::pin(
+            jcode_provider_openai::stream::OpenAIResponsesStream::new(byte_stream),
+        ),
+    };
 
     // Idle timeout between streamed chunks. Configurable so slow reasoning
     // models (e.g. DeepSeek) that think silently for minutes before emitting
@@ -258,7 +273,8 @@ async fn stream_response(
         let event = match tokio::time::timeout(stream_idle_timeout, stream.next()).await {
             Ok(Some(Ok(event))) => event,
             Ok(Some(Err(e))) => anyhow::bail!(
-                "OpenAI-compatible stream error\n  endpoint: {}\n  model: {}\n  auth: {}\n  error: {}",
+                "OpenAI-compatible {} stream error\n  endpoint: {}\n  model: {}\n  auth: {}\n  error: {}",
+                wire_api.log_name(),
                 url,
                 model,
                 auth.label(),
@@ -271,7 +287,8 @@ async fn stream_response(
                     idle_timeout_secs
                 ));
                 anyhow::bail!(
-                    "OpenAI-compatible stream timeout\n  endpoint: {}\n  model: {}\n  auth: {}\n  timeout: no data received for {} seconds\n{}",
+                    "OpenAI-compatible {} stream timeout\n  endpoint: {}\n  model: {}\n  auth: {}\n  timeout: no data received for {} seconds\n{}",
+                    wire_api.log_name(),
                     url,
                     model,
                     auth.label(),

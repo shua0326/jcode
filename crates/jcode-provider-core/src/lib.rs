@@ -48,8 +48,8 @@ pub use models::{
     provider_for_model_with_hint as core_provider_for_model_with_hint, provider_key_from_hint,
 };
 pub use reasoning::{
-    DEEPSEEK_SELECTABLE_EFFORTS, OPENAI_SELECTABLE_EFFORTS, OPENROUTER_SELECTABLE_EFFORTS,
-    canonical_reasoning_effort, inferred_reasoning_efforts,
+    DEEPSEEK_SELECTABLE_EFFORTS, MUSE_SPARK_SELECTABLE_EFFORTS, OPENAI_SELECTABLE_EFFORTS,
+    OPENROUTER_SELECTABLE_EFFORTS, canonical_reasoning_effort, inferred_reasoning_efforts,
 };
 pub use selection::{
     ActiveProvider, ProviderAvailability, auto_default_provider, cli_provider_arg_for_session_key,

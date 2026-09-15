@@ -32,6 +32,22 @@ pub const OPENROUTER_SELECTABLE_EFFORTS: &[&str] = &[
     "swarm-deep",
 ];
 
+/// Muse Spark effort levels exposed by OpenCode Go's Responses API.
+///
+/// The service accepts the OpenAI vocabulary through `xhigh`, but does not
+/// advertise `max` for Muse. Jcode's swarm modes remain available and map to
+/// the strongest real effort at request time.
+pub const MUSE_SPARK_SELECTABLE_EFFORTS: &[&str] = &[
+    "none",
+    "minimal",
+    "low",
+    "medium",
+    "high",
+    "xhigh",
+    "swarm",
+    "swarm-deep",
+];
+
 /// Direct DeepSeek effort levels, followed by Jcode's swarm modes.
 pub const DEEPSEEK_SELECTABLE_EFFORTS: &[&str] = &[
     "none",
@@ -65,6 +81,7 @@ pub fn inferred_reasoning_efforts(
     model_name: Option<&str>,
 ) -> Vec<&'static str> {
     let provider = provider_name.unwrap_or_default().to_ascii_lowercase();
+    let provider_id = provider.replace([' ', '_'], "-");
     let model = model_name.unwrap_or_default().to_ascii_lowercase();
 
     if provider.contains("openrouter") {
@@ -73,6 +90,10 @@ pub fn inferred_reasoning_efforts(
 
     if provider.contains("deepseek") || model.contains("deepseek") {
         return DEEPSEEK_SELECTABLE_EFFORTS.to_vec();
+    }
+
+    if provider_id.contains("opencode-go") && model.starts_with("muse-spark-") {
+        return MUSE_SPARK_SELECTABLE_EFFORTS.to_vec();
     }
 
     if provider.contains("z.ai") || provider == "zai" || model.starts_with("glm-") {
@@ -151,6 +172,22 @@ mod tests {
             inferred_reasoning_efforts(Some("openai-compatible:zai"), Some("glm-5.3-flash")),
             OPENAI_SELECTABLE_EFFORTS
         );
+    }
+
+    #[test]
+    fn opencode_go_muse_uses_its_documented_effort_ladder() {
+        assert_eq!(
+            inferred_reasoning_efforts(
+                Some("openai-compatible:opencode-go"),
+                Some("muse-spark-1.3-contributor")
+            ),
+            MUSE_SPARK_SELECTABLE_EFFORTS
+        );
+        assert_eq!(
+            inferred_reasoning_efforts(Some("OpenCode Go"), Some("muse-spark-1.2-contributor")),
+            MUSE_SPARK_SELECTABLE_EFFORTS
+        );
+        assert!(!MUSE_SPARK_SELECTABLE_EFFORTS.contains(&"max"));
     }
 
     #[test]

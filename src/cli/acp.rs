@@ -3809,6 +3809,32 @@ mod tests {
     }
 
     #[test]
+    fn config_options_include_opencode_go_muse_effort_ladder() {
+        let state = SessionUiState {
+            provider_name: Some("OpenCode Go".to_string()),
+            model: Some("muse-spark-1.3-contributor".to_string()),
+            reasoning_effort: Some("medium".to_string()),
+            ..SessionUiState::default()
+        };
+        let options = session_config_options(&state);
+        let effort = options
+            .iter()
+            .find(|option| option["id"] == CONFIG_ID_EFFORT)
+            .expect("Muse should expose an ACP reasoning control");
+        let values = effort["options"]
+            .as_array()
+            .expect("effort options")
+            .iter()
+            .filter_map(|option| option["value"].as_str())
+            .collect::<Vec<_>>();
+        assert_eq!(
+            values,
+            vec!["none", "minimal", "low", "medium", "high", "xhigh"]
+        );
+        assert_eq!(effort["currentValue"], "medium");
+    }
+
+    #[test]
     fn config_options_current_model_prepended_when_not_listed() {
         let state = SessionUiState {
             provider_name: Some("anthropic".to_string()),
