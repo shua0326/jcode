@@ -94,6 +94,10 @@ struct DaemonSession {
     working_dir: Option<PathBuf>,
     event_queue: Mutex<Option<tokio::sync::mpsc::Receiver<Result<ServerEvent>>>>,
     event_task: Mutex<Option<tokio::task::JoinHandle<()>>>,
+    /// Events a control request consumed but did not need. They still belong to
+    /// the prompt loop, so dropping them would lose streamed output; the prompt
+    /// loop drains this before the live queue.
+    deferred_events: Mutex<std::collections::VecDeque<ServerEvent>>,
 }
 
 /// Session-scoped provider/model state used to surface ACP `configOptions`
@@ -232,6 +236,7 @@ impl DaemonSession {
             working_dir: None,
             event_queue: Mutex::new(None),
             event_task: Mutex::new(None),
+            deferred_events: Mutex::new(std::collections::VecDeque::new()),
         }
     }
 
@@ -261,6 +266,9 @@ impl DaemonSession {
     }
 
     async fn read_event(&self) -> Result<ServerEvent> {
+        if let Some(event) = self.deferred_events.lock().await.pop_front() {
+            return Ok(event);
+        }
         let mut queue = self.event_queue.lock().await;
         if let Some(rx) = queue.as_mut() {
             return rx
@@ -270,6 +278,34 @@ impl DaemonSession {
         }
         drop(queue);
         self.read_wire_event().await
+    }
+
+    /// Hand an event this request does not need back to whoever owns the stream.
+    /// Bounded: a long control wait during a streaming turn must not grow without
+    /// limit, so the oldest deferred event is dropped past the cap.
+    async fn defer_event(&self, event: ServerEvent) {
+        const MAX_DEFERRED_EVENTS: usize = 512;
+        let mut deferred = self.deferred_events.lock().await;
+        // Live output snapshots replace earlier ones for the same tool call, so a
+        // long control wait cannot stack stale copies of the same stream.
+        if let ServerEvent::ToolOutput { id, .. } = &event
+            && let Some(slot) = deferred.iter_mut().find(|queued| {
+                matches!(queued, ServerEvent::ToolOutput { id: queued_id, .. } if queued_id == id)
+            })
+        {
+            *slot = event;
+            return;
+        }
+        if deferred.len() >= MAX_DEFERRED_EVENTS {
+            deferred.pop_front();
+        }
+        deferred.push_back(event);
+    }
+
+    /// Drop deferred events that predate a new turn so a stale delta cannot be
+    /// replayed as if it arrived now.
+    async fn clear_deferred_events(&self) {
+        self.deferred_events.lock().await.clear();
     }
 
     async fn read_wire_event(&self) -> Result<ServerEvent> {
@@ -1316,14 +1352,18 @@ impl AcpRuntime {
             return Ok(());
         }
 
-        let skills =
-            crate::skill::SkillRegistry::load_for_working_dir(session.working_dir.as_deref())?;
-        if matches!(text.trim_end(), "/skills" | "/usage" | "/limits") {
-            let listing = if text.trim_end() == "/limits" {
+        // Skill metadata is only needed for slash invocations. A normal prompt
+        // must not pay a filesystem scan of every skill directory.
+        let trimmed = text.trim_end();
+        if matches!(trimmed, "/skills" | "/usage" | "/limits") {
+            let listing = if trimmed == "/limits" {
                 acp_account_limits().await
-            } else if text.trim_end() == "/usage" {
+            } else if trimmed == "/usage" {
                 acp_usage_listing(&*session.ui_state.lock().await)
             } else {
+                let skills = crate::skill::SkillRegistry::load_for_working_dir(
+                    session.working_dir.as_deref(),
+                )?;
                 acp_skill_listing(&skills)
             };
             self.write_available_commands(&session.session_id).await?;
@@ -1340,12 +1380,21 @@ impl AcpRuntime {
                 .await?;
             return Ok(());
         }
-        let (text, active_skill) = acp_skill_prompt(&skills, &text);
+        let (text, active_skill) = if text.starts_with('/') {
+            let skills =
+                crate::skill::SkillRegistry::load_for_working_dir(session.working_dir.as_deref())?;
+            acp_skill_prompt(&skills, &text)
+        } else {
+            (text, None)
+        };
         let prompt_id = session.next_id();
         {
             let mut active = session.active_prompt_id.lock().await;
             *active = Some(prompt_id);
         }
+        // Events deferred by an earlier control request belong to that turn, not
+        // this one; replaying them would duplicate streamed output.
+        session.clear_deferred_events().await;
 
         let send_result = session
             .send(&Request::Message {
@@ -1669,7 +1718,7 @@ async fn wait_for_done(session: &DaemonSession, request_id: u64) -> Result<()> {
             ServerEvent::Ack { .. } => {}
             ServerEvent::Done { id } if id == request_id => return Ok(()),
             ServerEvent::Error { id, message, .. } if id == request_id => anyhow::bail!(message),
-            _ => {}
+            other => session.defer_event(other).await,
         }
     }
 }
@@ -1688,7 +1737,7 @@ async fn request_history(session: &DaemonSession) -> Result<ServerEvent> {
                 message,
                 ..
             } if event_id == id => anyhow::bail!(message),
-            _ => {}
+            other => session.defer_event(other).await,
         }
     }
 }
@@ -1720,7 +1769,7 @@ async fn request_model_catalog_inner(session: &DaemonSession) -> Result<ServerEv
                 message,
                 ..
             } if event_id == id => anyhow::bail!(message),
-            _ => {}
+            other => session.defer_event(other).await,
         }
     }
 }
@@ -2142,7 +2191,7 @@ async fn wait_for_model_changed_inner(session: &DaemonSession, request_id: u64) 
             ServerEvent::Error { id, message, .. } if id == request_id => {
                 anyhow::bail!(message)
             }
-            _ => {}
+            other => session.defer_event(other).await,
         }
     }
 }
@@ -2162,7 +2211,7 @@ async fn wait_for_effort_changed(session: &DaemonSession, request_id: u64) -> Re
             ServerEvent::Error { id, message, .. } if id == request_id => {
                 anyhow::bail!(message)
             }
-            _ => {}
+            other => session.defer_event(other).await,
         }
     }
 }
@@ -3010,9 +3059,14 @@ fn agent_message_chunk(text: String) -> Value {
     })
 }
 
+/// Upper bound for a file preview shipped to an ACP client. The client renders
+/// `oldText`/`newText` as the whole file, so larger paths are skipped instead of
+/// sending megabytes of JSON per edit.
+const ACP_DIFF_MAX_BYTES: u64 = 256 * 1024;
+
 fn bounded_file_text(path: &std::path::Path) -> Option<String> {
     let metadata = std::fs::metadata(path).ok()?;
-    if !metadata.is_file() || metadata.len() > 1_048_576 {
+    if !metadata.is_file() || metadata.len() > ACP_DIFF_MAX_BYTES {
         return None;
     }
     std::fs::read_to_string(path).ok()
@@ -3896,5 +3950,82 @@ mod tests {
             state.context_limit(),
             crate::provider::DEFAULT_CONTEXT_LIMIT as u64
         );
+    }
+
+    #[cfg(unix)]
+    fn test_daemon_session() -> DaemonSession {
+        let (client, _server) = tokio::net::UnixStream::pair().expect("unix socket pair");
+        let (reader, writer) = client.into_split();
+        DaemonSession::new("deferred-test".to_string(), reader, writer, 1)
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn deferred_control_events_replay_in_order_and_stop_at_the_cap() {
+        let session = test_daemon_session();
+        // A control request (model switch, catalog refresh) must not swallow
+        // streamed output belonging to the running turn.
+        session
+            .defer_event(ServerEvent::TextDelta {
+                text: "kept".into(),
+            })
+            .await;
+        session
+            .defer_event(ServerEvent::ToolOutput {
+                id: "tool-1".into(),
+                output: "streamed".into(),
+            })
+            .await;
+
+        match session.read_event().await.expect("first deferred event") {
+            ServerEvent::TextDelta { text } => assert_eq!(text, "kept"),
+            other => panic!("expected TextDelta, got {other:?}"),
+        }
+        assert!(matches!(
+            session.read_event().await.expect("second deferred event"),
+            ServerEvent::ToolOutput { .. }
+        ));
+
+        // A new turn starts clean: the previous turn's deferred events are gone.
+        session.clear_deferred_events().await;
+        assert!(session.deferred_events.lock().await.is_empty());
+
+        // Repeated live snapshots for one tool call collapse to the newest.
+        session
+            .defer_event(ServerEvent::ToolOutput {
+                id: "tool-1".into(),
+                output: "first".into(),
+            })
+            .await;
+        session
+            .defer_event(ServerEvent::ToolOutput {
+                id: "tool-1".into(),
+                output: "second".into(),
+            })
+            .await;
+        {
+            let deferred = session.deferred_events.lock().await;
+            assert_eq!(deferred.len(), 1, "one stream must not stack snapshots");
+            match deferred.front() {
+                Some(ServerEvent::ToolOutput { output, .. }) => assert_eq!(output, "second"),
+                other => panic!("expected the newest snapshot, got {other:?}"),
+            }
+        }
+        session.clear_deferred_events().await;
+
+        // The queue is bounded, so a long control wait cannot grow without limit.
+        for index in 0..1100 {
+            session
+                .defer_event(ServerEvent::TextDelta {
+                    text: format!("event-{index}"),
+                })
+                .await;
+        }
+        let deferred = session.deferred_events.lock().await;
+        assert_eq!(deferred.len(), 512);
+        match deferred.front() {
+            Some(ServerEvent::TextDelta { text }) => assert_eq!(text, "event-588"),
+            other => panic!("expected the oldest surviving TextDelta, got {other:?}"),
+        }
     }
 }
