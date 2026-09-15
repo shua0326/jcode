@@ -545,6 +545,13 @@ struct CommandOutputStream {
     text: String,
     last_emit: Option<Instant>,
 }
+
+/// Live-preview tail kept per running command. The preview is re-sent in full on
+/// every emit, so a smaller window directly bounds client and wire cost.
+const COMMAND_OUTPUT_PREVIEW_BYTES: usize = 16 * 1024;
+/// Minimum gap between preview emits. Each emit clones and re-serializes the tail.
+const COMMAND_OUTPUT_EMIT_INTERVAL: Duration = Duration::from_millis(400);
+
 impl CommandOutputStream {
     fn new(ctx: &ToolContext) -> Self {
         Self {
@@ -556,8 +563,17 @@ impl CommandOutputStream {
     }
     fn append(&mut self, text: &str) {
         self.text.push_str(text);
-        if self.text.len() > 65536 {
-            let mut start = self.text.len() - 65536;
+        self.finish_append();
+    }
+    /// Append one complete line without allocating a temporary `format!` string.
+    fn append_line(&mut self, line: &str) {
+        self.text.push_str(line);
+        self.text.push('\n');
+        self.finish_append();
+    }
+    fn finish_append(&mut self) {
+        if self.text.len() > COMMAND_OUTPUT_PREVIEW_BYTES {
+            let mut start = self.text.len() - COMMAND_OUTPUT_PREVIEW_BYTES;
             while !self.text.is_char_boundary(start) {
                 start += 1;
             }
@@ -565,7 +581,7 @@ impl CommandOutputStream {
         }
         if self
             .last_emit
-            .is_none_or(|t| t.elapsed() >= Duration::from_millis(200))
+            .is_none_or(|t| t.elapsed() >= COMMAND_OUTPUT_EMIT_INTERVAL)
         {
             crate::bus::Bus::global().publish(crate::bus::BusEvent::ToolOutput {
                 session_id: self.session_id.clone(),
@@ -600,7 +616,7 @@ where
             stream
                 .lock()
                 .unwrap_or_else(|e| e.into_inner())
-                .append(&format!("{line}\n"));
+                .append_line(&line);
         }
         buf.push_str(&line);
         buf.push('\n');
@@ -1206,8 +1222,12 @@ impl BashTool {
         let mut stream = CommandOutputStream::new(ctx);
         let mut output_offset = 0u64;
 
+        // Keep one read handle for the running command instead of reopening the
+        // output file on every poll tick.
+        let mut output_file = tokio::fs::File::open(&info.output_file).await.ok();
+
         loop {
-            if let Ok(mut file) = tokio::fs::File::open(&info.output_file).await {
+            if let Some(file) = output_file.as_mut() {
                 use tokio::io::AsyncSeekExt;
                 if file
                     .seek(std::io::SeekFrom::Start(output_offset))
@@ -1222,11 +1242,14 @@ impl BashTool {
                         }
                     }
                 }
+            } else {
+                output_file = tokio::fs::File::open(&info.output_file).await.ok();
             }
             if let Some(status) = child.try_wait()? {
                 let output = tokio::fs::read_to_string(&info.output_file)
                     .await
                     .unwrap_or_default();
+                drop(output_file.take());
                 let _ = tokio::fs::remove_file(&info.output_file).await;
                 let _ = tokio::fs::remove_file(&info.status_file).await;
                 return Ok(
