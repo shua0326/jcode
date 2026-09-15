@@ -186,16 +186,16 @@ async fn assign_task_to_client_attached_session_skips_server_side_run() {
 }
 
 #[tokio::test]
-async fn acp_headless_assignment_uses_runner_without_duplicate_interrupt() {
+async fn headless_agent_assignment_uses_runner_without_duplicate_interrupt() {
     let (_env, _runtime) = RuntimeEnvGuard::new();
     let swarm_id = "swarm-client-attached";
     let requester = "coord";
     let worker = "worker-attached";
     let (client_tx, mut client_rx) = mpsc::unbounded_channel();
 
-    // The worker has a live server-side agent AND a live client connection:
-    // the agent exists, so the only reason to skip the server-side run is the
-    // client attachment.
+    // The worker has a live server-side agent and no client connection, so the
+    // server owns its turn loop: this is the headless case that must route the
+    // assignment to the runner without also queueing a soft interrupt.
     let worker_agent = test_agent().await;
     let sessions = Arc::new(RwLock::new(HashMap::from([(
         worker.to_string(),
@@ -212,7 +212,7 @@ async fn acp_headless_assignment_uses_runner_without_duplicate_interrupt() {
             member.role = "coordinator".to_string();
             member
         }),
-        // Owned visible worker: drivable for auto-pick, but client-attached.
+        // Owned visible worker: drivable for auto-pick, but headless here.
         (
             worker.to_string(),
             owned_member(worker, swarm_id, "ready", requester),
@@ -289,7 +289,7 @@ async fn acp_headless_assignment_uses_runner_without_duplicate_interrupt() {
         assert_eq!(item.assigned_to.as_deref(), Some(worker));
     }
 
-    // The assignment was handed to the live client as a soft interrupt.
+    // The headless runner owns this assignment, so no soft interrupt is queued.
     assert!(
         !worker_guard.has_soft_interrupts(),
         "headless runner must receive the assignment without a second soft interrupt"
