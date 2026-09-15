@@ -498,7 +498,7 @@ impl Tool for BgTool {
                 "wake": { "type": "boolean", "description": "When using delivery/watch/subscribe, whether to wake on completion. Defaults to true." },
                 "stall_wake_seconds": { "type": "integer", "description": "For delivery/watch: also wake the agent after this many seconds of no output/progress (min 30, resets on activity). Use for long jobs that may hang silently." },
                 "max_wait_seconds": { "type": "integer", "description": "For wait: max seconds to block. Default 60, cap 3600, 0 = immediate check." },
-                "return_on_progress": { "type": "boolean", "description": "For wait: return on the first progress/checkpoint event too. Defaults to false; omit it to wait for completion or timeout." },
+                "return_on_progress": { "type": "boolean", "description": "For wait: return on the first progress event too. Defaults to false." },
                 "wait_mode": { "type": "string", "enum": ["any", "all", "first_failure"], "description": "For multi-task wait, return on any completion, all completions, or first failure. Defaults to any." },
                 "tail_lines": { "type": "integer", "description": "Return only the last N output lines for output/tail/wait preview." },
                 "lines": { "type": "integer", "description": "Alias for tail_lines." },
