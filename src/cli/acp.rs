@@ -269,6 +269,20 @@ impl DaemonSession {
         if let Some(event) = self.deferred_events.lock().await.pop_front() {
             return Ok(event);
         }
+        self.read_live_event().await
+    }
+
+    /// Read the next event *without* draining events deferred by control
+    /// requests, for use by those same control requests.
+    ///
+    /// A control request must not use [`Self::read_event`]: it would immediately
+    /// re-read the event it just deferred, defer it again, and spin on it
+    /// forever instead of ever seeing its own reply.
+    async fn read_event_for_control(&self) -> Result<ServerEvent> {
+        self.read_live_event().await
+    }
+
+    async fn read_live_event(&self) -> Result<ServerEvent> {
         let mut queue = self.event_queue.lock().await;
         if let Some(rx) = queue.as_mut() {
             return rx
@@ -1740,7 +1754,7 @@ async fn cleanup_prompt_state(session: &DaemonSession) {
 
 async fn wait_for_done(session: &DaemonSession, request_id: u64) -> Result<()> {
     loop {
-        match session.read_event().await? {
+        match session.read_event_for_control().await? {
             ServerEvent::Ack { .. } => {}
             ServerEvent::Done { id } if id == request_id => return Ok(()),
             ServerEvent::Error { id, message, .. } if id == request_id => anyhow::bail!(message),
@@ -1753,7 +1767,7 @@ async fn request_history(session: &DaemonSession) -> Result<ServerEvent> {
     let id = session.next_id();
     session.send(&Request::GetHistory { id }).await?;
     loop {
-        match session.read_event().await? {
+        match session.read_event_for_control().await? {
             ServerEvent::Ack { .. } => {}
             event @ ServerEvent::History { id: event_id, .. } if event_id == id => {
                 return Ok(event);
@@ -1785,7 +1799,7 @@ async fn request_model_catalog_inner(session: &DaemonSession) -> Result<ServerEv
         })
         .await?;
     loop {
-        match session.read_event().await? {
+        match session.read_event_for_control().await? {
             ServerEvent::Ack { .. } => {}
             event @ ServerEvent::History { id: event_id, .. } if event_id == id => {
                 return Ok(event);
@@ -2195,7 +2209,7 @@ async fn wait_for_model_changed(session: &DaemonSession, request_id: u64) -> Res
 }
 async fn wait_for_model_changed_inner(session: &DaemonSession, request_id: u64) -> Result<()> {
     loop {
-        match session.read_event().await? {
+        match session.read_event_for_control().await? {
             ServerEvent::Ack { .. } => {}
             ServerEvent::ModelChanged {
                 id,
@@ -2224,7 +2238,7 @@ async fn wait_for_model_changed_inner(session: &DaemonSession, request_id: u64) 
 
 async fn wait_for_effort_changed(session: &DaemonSession, request_id: u64) -> Result<()> {
     loop {
-        match session.read_event().await? {
+        match session.read_event_for_control().await? {
             ServerEvent::Ack { .. } => {}
             ServerEvent::ReasoningEffortChanged { id, effort, error } if id == request_id => {
                 if let Some(error) = error {
@@ -4081,6 +4095,47 @@ mod tests {
             Some(ServerEvent::TextDelta { text }) => assert_eq!(text, "event-588"),
             other => panic!("expected the oldest surviving TextDelta, got {other:?}"),
         }
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn control_reads_do_not_reconsume_deferred_events() {
+        use tokio::io::AsyncWriteExt;
+        let (client, mut server) = tokio::net::UnixStream::pair().expect("unix socket pair");
+        let (reader, writer) = client.into_split();
+        let session = DaemonSession::new("deferred-control".to_string(), reader, writer, 1);
+        let wire_event = serde_json::to_string(&ServerEvent::TextDelta {
+            text: "from-wire".into(),
+        })
+        .expect("serialize wire event");
+        server
+            .write_all(format!("{wire_event}\n").as_bytes())
+            .await
+            .expect("write wire event");
+
+        // A control request defers an unrelated event and must still reach its own
+        // reply: draining the deferred queue here would spin on that one event
+        // forever, which is exactly how session/new used to hang.
+        session
+            .defer_event(ServerEvent::ToolOutput {
+                id: "tool-1".into(),
+                output: "deferred".into(),
+            })
+            .await;
+        match session
+            .read_event_for_control()
+            .await
+            .expect("control read")
+        {
+            ServerEvent::TextDelta { text } => assert_eq!(text, "from-wire"),
+            other => panic!("control read stole a deferred event: {other:?}"),
+        }
+
+        // The stream owner still receives the deferred event before new ones.
+        assert!(matches!(
+            session.read_event().await.expect("stream read"),
+            ServerEvent::ToolOutput { .. }
+        ));
     }
 
     #[test]
