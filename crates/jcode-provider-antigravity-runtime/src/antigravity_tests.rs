@@ -699,3 +699,52 @@ fn set_model_stores_bare_id_for_prefixed_session_restore_spec() {
     );
     assert!(provider.set_model("   ").is_err());
 }
+
+#[test]
+fn wire_body_matches_cli_envelope_shape() {
+    let inner = antigravity_wire_request(
+        json!([{ "role": "user", "parts": [{ "text": "hi" }] }]),
+        Some("session-abc"),
+        Some(&json!({ "role": "user", "parts": [{ "text": "sys" }] })),
+        Some(&json!([{ "functionDeclarations": [] }])),
+        None,
+        "trajectory-1",
+        0,
+    );
+    let body = antigravity_wire_body(
+        "project-1",
+        "gemini-3.1-pro-high",
+        inner,
+        "trajectory-1",
+        "conversation-1",
+        0,
+        1_700_000_000_000,
+    );
+
+    // The Cloud Code backend fingerprints the CLI shape; omitting these keys is
+    // what produced a generic 429 RESOURCE_EXHAUSTED on the production host.
+    assert_eq!(body["requestType"], "agent");
+    assert_eq!(body["userAgent"], "antigravity");
+    assert_eq!(
+        body["requestId"],
+        "agent/trajectory-1/1700000000000/conversation-1/0"
+    );
+    assert_eq!(body["project"], "project-1");
+    assert_eq!(body["model"], "gemini-3.1-pro-high");
+    assert!(body.get("user_prompt_id").is_none());
+
+    let request = &body["request"];
+    assert_eq!(request["sessionId"], "session-abc");
+    assert!(request.get("session_id").is_none());
+    assert_eq!(request["labels"]["trajectory_id"], "trajectory-1");
+    assert_eq!(request["labels"]["request_id"], "trajectory-1-0");
+    assert!(request.get("systemInstruction").is_some());
+    assert!(request.get("tools").is_some());
+}
+
+#[test]
+fn wire_request_omits_blank_session_id() {
+    let inner = antigravity_wire_request(json!([]), Some("   "), None, None, None, "t", 3);
+    assert!(inner.get("sessionId").is_none());
+    assert_eq!(inner["labels"]["last_step_index"], "3");
+}

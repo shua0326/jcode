@@ -10,9 +10,10 @@ use jcode_base::auth::antigravity as antigravity_auth;
 use jcode_message_types::{ConnectionPhase, Message, StreamEvent, ToolDefinition};
 use jcode_provider_antigravity::{
     AVAILABLE_MODELS, CatalogModel, CatalogSnapshot, DEFAULT_FALLBACK_MODEL,
-    GENERATE_CONTENT_API_URL, PersistedCatalog, X_GOOG_API_CLIENT, antigravity_compatible_schema,
-    antigravity_user_agent, catalog_is_stale, catalog_model_detail, client_metadata_header,
-    is_retryable_empty_turn, merge_antigravity_model_ids, remap_unsupported_model,
+    GENERATE_CONTENT_ENDPOINT_CANDIDATES, PersistedCatalog, X_GOOG_API_CLIENT,
+    antigravity_compatible_schema, antigravity_user_agent, catalog_is_stale, catalog_model_detail,
+    client_metadata_header, is_retryable_empty_turn, merge_antigravity_model_ids,
+    remap_unsupported_model,
 };
 #[cfg(test)]
 use jcode_provider_antigravity::{
@@ -31,6 +32,75 @@ use tokio_stream::wrappers::ReceiverStream;
 use uuid::Uuid;
 
 const DEFAULT_MODEL: &str = "default";
+
+/// Build the Antigravity CLI wire envelope for a `generateContent` call.
+///
+/// The Cloud Code backend fingerprints the CLI shape: `requestType`,
+/// `userAgent`, and a `requestId` of the form
+/// `agent/<trajectory>/<epoch_ms>/<conversation>/<step>`. Requests sent in the
+/// older Gemini-CLI shape (`user_prompt_id`, no `requestType`) are answered
+/// with a generic HTTP 429 RESOURCE_EXHAUSTED on some accounts even while quota
+/// remains, so this mirrors the CLI rather than the Gemini CLI.
+fn antigravity_wire_body(
+    project: &str,
+    model: &str,
+    inner: serde_json::Map<String, Value>,
+    trajectory_id: &str,
+    conversation_id: &str,
+    step_index: usize,
+    now_ms: i64,
+) -> Value {
+    json!({
+        "project": project,
+        "model": model,
+        "requestType": "agent",
+        "userAgent": "antigravity",
+        "requestId": format!("agent/{trajectory_id}/{now_ms}/{conversation_id}/{step_index}"),
+        "request": Value::Object(inner),
+    })
+}
+
+/// Inner request object for the CLI envelope: camelCase `sessionId` and the
+/// `labels` fingerprint the CLI attaches to every agent turn.
+fn antigravity_wire_request(
+    contents: Value,
+    session_id: Option<&str>,
+    system_instruction: Option<&Value>,
+    tools: Option<&Value>,
+    tool_config: Option<&Value>,
+    trajectory_id: &str,
+    step_index: usize,
+) -> serde_json::Map<String, Value> {
+    let mut inner = serde_json::Map::new();
+    inner.insert("contents".to_string(), contents);
+    if let Some(session_id) = session_id.filter(|value| !value.trim().is_empty()) {
+        inner.insert(
+            "sessionId".to_string(),
+            Value::String(session_id.to_string()),
+        );
+    }
+    if let Some(system) = system_instruction {
+        inner.insert("systemInstruction".to_string(), system.clone());
+    }
+    if let Some(tools) = tools {
+        inner.insert("tools".to_string(), tools.clone());
+    }
+    if let Some(tool_config) = tool_config {
+        inner.insert("toolConfig".to_string(), tool_config.clone());
+    }
+    inner.insert(
+        "labels".to_string(),
+        json!({
+            "last_step_index": step_index.to_string(),
+            "request_id": format!("{trajectory_id}-0"),
+            "trajectory_id": trajectory_id,
+            "used_claude": "false",
+            "used_claude_conservative": "false",
+            "used_non_gemini_model": "false",
+        }),
+    );
+    inner
+}
 
 pub struct AntigravityProvider {
     client: reqwest::Client,
@@ -401,37 +471,85 @@ impl AntigravityProvider {
             ],
         );
 
-        let response = self
-            .client
-            .post(GENERATE_CONTENT_API_URL)
-            .bearer_auth(&tokens.access_token)
-            .header(reqwest::header::CONTENT_TYPE, "application/json")
-            .header(reqwest::header::USER_AGENT, antigravity_user_agent())
-            .header("x-goog-api-client", X_GOOG_API_CLIENT)
-            .header(
-                "x-goog-request-params",
-                format!("project={}", request.project),
-            )
-            .header("x-goog-client-metadata", client_metadata_header())
-            .json(&request)
-            .send()
-            .await
-            .context("Failed to send Antigravity generateContent request")?;
+        // Antigravity CLI wire envelope. The backend fingerprints requests the
+        // way the CLI (and the workspace-gateway clients derived from it) send
+        // them: `requestType`/`userAgent`/`requestId` on the envelope, camelCase
+        // `sessionId` inside the request, and a `labels` fingerprint carrying the
+        // trajectory id. Requests without them are answered with a generic
+        // HTTP 429 RESOURCE_EXHAUSTED on some accounts even when quota remains.
+        let trajectory_id = Uuid::new_v4().to_string();
+        let conversation_id = Uuid::new_v4().to_string();
+        let step_index = content_items.len().saturating_sub(1);
+        let tool_config_value = request
+            .request
+            .tool_config
+            .as_ref()
+            .and_then(|config| serde_json::to_value(config).ok());
+        let inner = antigravity_wire_request(
+            contents_value.clone(),
+            request.request.session_id.as_deref(),
+            system_value.as_ref(),
+            tools_value.as_ref(),
+            tool_config_value.as_ref(),
+            &trajectory_id,
+            step_index,
+        );
+        let body = antigravity_wire_body(
+            &request.project,
+            &request.model,
+            inner,
+            &trajectory_id,
+            &conversation_id,
+            step_index,
+            chrono::Utc::now().timestamp_millis(),
+        );
 
-        if !response.status().is_success() {
+        // Walk the CLI endpoint cascade. A throttled or unknown-path response on
+        // one host does not mean the account is exhausted on the others, and the
+        // production host is the one most likely to be throttled.
+        let mut last_failure: Option<anyhow::Error> = None;
+        for endpoint in GENERATE_CONTENT_ENDPOINT_CANDIDATES {
+            let response = self
+                .client
+                .post(format!("{endpoint}/v1internal:generateContent"))
+                .bearer_auth(&tokens.access_token)
+                .header(reqwest::header::CONTENT_TYPE, "application/json")
+                .header(reqwest::header::USER_AGENT, antigravity_user_agent())
+                .header("x-goog-api-client", X_GOOG_API_CLIENT)
+                .header(
+                    "x-goog-request-params",
+                    format!("project={}", request.project),
+                )
+                .header("x-goog-client-metadata", client_metadata_header())
+                .json(&body)
+                .send()
+                .await
+                .context("Failed to send Antigravity generateContent request")?;
+
+            if response.status().is_success() {
+                return response
+                    .json()
+                    .await
+                    .context("Failed to decode Antigravity generateContent response");
+            }
+
             let status = response.status();
-            let body = jcode_base::util::http_error_body(response, "HTTP error").await;
-            anyhow::bail!(
+            let body_text = jcode_base::util::http_error_body(response, "HTTP error").await;
+            last_failure = Some(anyhow::anyhow!(
                 "Antigravity generateContent failed (HTTP {}): {}",
                 status,
-                body.trim()
-            );
+                body_text.trim()
+            ));
+            // Only statuses that another endpoint (or a later attempt) can
+            // plausibly serve are worth retrying on the next host.
+            if !matches!(status.as_u16(), 403 | 404 | 429 | 500 | 502 | 503 | 504) {
+                break;
+            }
         }
 
-        response
-            .json()
-            .await
-            .context("Failed to decode Antigravity generateContent response")
+        Err(last_failure.unwrap_or_else(|| {
+            anyhow::anyhow!("Antigravity generateContent failed: no endpoint available")
+        }))
     }
 }
 

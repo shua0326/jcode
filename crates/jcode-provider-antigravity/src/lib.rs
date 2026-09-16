@@ -22,6 +22,20 @@ pub const FETCH_MODELS_API_URL: &str =
     "https://cloudcode-pa.googleapis.com/v1internal:fetchAvailableModels";
 pub const GENERATE_CONTENT_API_URL: &str =
     "https://cloudcode-pa.googleapis.com/v1internal:generateContent";
+/// Endpoint preference for Antigravity `generateContent`, in the order the
+/// Antigravity CLI (and the working pi extension) tries them. The production
+/// `cloudcode-pa` host throttles accounts that the daily host still serves, so
+/// it is the last resort rather than the first choice.
+pub const GENERATE_CONTENT_ENDPOINT_CANDIDATES: &[&str] = &[
+    "https://daily-cloudcode-pa.googleapis.com",
+    "https://daily-cloudcode-pa.sandbox.googleapis.com",
+    "https://cloudcode-pa.googleapis.com",
+];
+/// CLI wire fingerprint used by the Antigravity CLI client id. Requests sent
+/// with the older `antigravity/<version> <os>/<arch>` shape are throttled with
+/// a generic HTTP 429 RESOURCE_EXHAUSTED against the daily endpoints.
+pub const ANTIGRAVITY_CLI_VERSION: &str = "1.1.23";
+pub const USER_AGENT_ENV: &str = "JCODE_ANTIGRAVITY_USER_AGENT";
 const VERSION_ENV: &str = "JCODE_ANTIGRAVITY_VERSION";
 pub const ANTIGRAVITY_VERSION: &str = "1.18.3";
 pub const X_GOOG_API_CLIENT: &str = "google-cloud-sdk vscode_cloudshelleditor/0.1";
@@ -125,13 +139,31 @@ pub fn antigravity_version() -> String {
 }
 
 pub fn antigravity_user_agent() -> String {
-    if cfg!(target_os = "windows") {
-        format!("antigravity/{} windows/amd64", antigravity_version())
-    } else if cfg!(target_arch = "aarch64") {
-        format!("antigravity/{} darwin/arm64", antigravity_version())
-    } else {
-        format!("antigravity/{} darwin/amd64", antigravity_version())
+    if let Ok(value) = std::env::var(USER_AGENT_ENV) {
+        let trimmed = value.trim();
+        if !trimmed.is_empty() {
+            return trimmed.to_string();
+        }
     }
+
+    // Match the Antigravity CLI wire fingerprint. The Cloud Code backend
+    // fingerprints the CLI here (`aidev_client`, `auth_method=consumer`) and
+    // throttles the desktop-app shape with a generic RESOURCE_EXHAUSTED 429.
+    let os_type = if cfg!(target_os = "windows") {
+        "windows"
+    } else if cfg!(target_os = "macos") {
+        "darwin"
+    } else {
+        "linux"
+    };
+    let arch = if cfg!(target_arch = "aarch64") {
+        "arm64"
+    } else {
+        "amd64"
+    };
+    format!(
+        "antigravity/cli/{ANTIGRAVITY_CLI_VERSION} (aidev_client; os_type={os_type}; arch={arch}; cl=974125021; auth_method=consumer)"
+    )
 }
 
 pub fn client_metadata_header() -> String {
@@ -576,5 +608,40 @@ pub fn flatten_schema_combiners(schema: &Value) -> Value {
         }
         Value::Array(items) => Value::Array(items.iter().map(flatten_schema_combiners).collect()),
         _ => schema.clone(),
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn user_agent_matches_cli_wire_fingerprint() {
+        // The backend throttles the desktop-app shape with a generic 429, so the
+        // default must stay on the CLI fingerprint.
+        let agent = antigravity_user_agent();
+        assert!(
+            agent.starts_with(&format!("antigravity/cli/{ANTIGRAVITY_CLI_VERSION} (aidev_client;")),
+            "unexpected user agent: {agent}"
+        );
+        assert!(agent.contains("auth_method=consumer"), "unexpected user agent: {agent}");
+        assert!(
+            agent.contains(if cfg!(target_os = "macos") { "os_type=darwin" } else { "os_type=" }),
+            "unexpected user agent: {agent}"
+        );
+    }
+
+    #[test]
+    fn generate_content_endpoints_try_daily_host_first() {
+        // The production host answers the working CLI shape with 429 while the
+        // daily host serves it, so it must not be the first candidate.
+        assert_eq!(
+            GENERATE_CONTENT_ENDPOINT_CANDIDATES[0],
+            "https://daily-cloudcode-pa.googleapis.com"
+        );
+        assert_eq!(
+            *GENERATE_CONTENT_ENDPOINT_CANDIDATES.last().unwrap(),
+            "https://cloudcode-pa.googleapis.com"
+        );
     }
 }
