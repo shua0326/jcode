@@ -527,6 +527,9 @@ impl AntigravityProvider {
                 .context("Failed to send Antigravity generateContent request")?;
 
             if response.status().is_success() {
+                jcode_base::logging::info(&format!(
+                    "Antigravity generateContent served by {endpoint}"
+                ));
                 return response
                     .json()
                     .await
@@ -535,6 +538,9 @@ impl AntigravityProvider {
 
             let status = response.status();
             let body_text = jcode_base::util::http_error_body(response, "HTTP error").await;
+            jcode_base::logging::info(&format!(
+                "Antigravity generateContent endpoint {endpoint} returned HTTP {status}"
+            ));
             last_failure = Some(anyhow::anyhow!(
                 "Antigravity generateContent failed (HTTP {}): {}",
                 status,
