@@ -2431,6 +2431,9 @@ impl Provider for MultiProvider {
             ActiveProvider::OpenRouter => self
                 .active_openrouter_execution_provider()
                 .and_then(|o| o.reasoning_effort()),
+            ActiveProvider::Antigravity => self
+                .antigravity_provider()
+                .and_then(|provider| provider.reasoning_effort()),
             _ => None,
         }
     }
@@ -2452,6 +2455,10 @@ impl Provider for MultiProvider {
             ActiveProvider::OpenRouter => self
                 .active_openrouter_execution_provider()
                 .ok_or_else(|| anyhow::anyhow!("OpenAI-compatible provider not available"))?
+                .set_reasoning_effort(effort),
+            ActiveProvider::Antigravity => self
+                .antigravity_provider()
+                .ok_or_else(|| anyhow::anyhow!("Antigravity provider not available"))?
                 .set_reasoning_effort(effort),
             _ => Err(anyhow::anyhow!(
                 "Reasoning effort is only supported for OpenAI, Anthropic, and compatible reasoning models"
@@ -2477,6 +2484,10 @@ impl Provider for MultiProvider {
                 Some(provider) => provider.available_efforts(),
                 None => vec![],
             },
+            ActiveProvider::Antigravity => self
+                .antigravity_provider()
+                .map(|provider| provider.available_efforts())
+                .unwrap_or_default(),
             _ => vec![],
         }
     }

@@ -708,6 +708,7 @@ fn wire_body_matches_cli_envelope_shape() {
         Some(&json!({ "role": "user", "parts": [{ "text": "sys" }] })),
         Some(&json!([{ "functionDeclarations": [] }])),
         None,
+        None,
         "trajectory-1",
         0,
     );
@@ -744,7 +745,46 @@ fn wire_body_matches_cli_envelope_shape() {
 
 #[test]
 fn wire_request_omits_blank_session_id() {
-    let inner = antigravity_wire_request(json!([]), Some("   "), None, None, None, "t", 3);
+    let inner =
+        antigravity_wire_request(json!([]), Some("   "), None, None, None, None, "t", 3);
     assert!(inner.get("sessionId").is_none());
     assert_eq!(inner["labels"]["last_step_index"], "3");
+}
+
+#[test]
+fn wire_request_carries_thinking_config_when_effort_is_set() {
+    let inner = antigravity_wire_request(
+        json!([]),
+        None,
+        None,
+        None,
+        None,
+        Some(&json!({ "includeThoughts": false, "thinkingBudget": 10_001 })),
+        "trajectory-1",
+        0,
+    );
+    assert_eq!(inner["generationConfig"]["thinkingConfig"]["thinkingBudget"], 10_001);
+    assert_eq!(inner["generationConfig"]["thinkingConfig"]["includeThoughts"], false);
+}
+
+#[test]
+fn wire_request_omits_thinking_config_without_a_stored_effort() {
+    let inner = antigravity_wire_request(json!([]), None, None, None, None, None, "trajectory-1", 0);
+    assert!(inner.get("generationConfig").is_none());
+}
+
+#[test]
+fn provider_exposes_the_antigravity_thinking_ladder() {
+    let provider = AntigravityProvider::new();
+    assert_eq!(
+        provider.available_efforts(),
+        vec!["none", "low", "medium", "high"]
+    );
+    assert!(provider.reasoning_effort().is_none());
+    provider.set_reasoning_effort("high").unwrap();
+    assert_eq!(provider.reasoning_effort().as_deref(), Some("high"));
+    assert!(
+        provider.set_reasoning_effort("xhigh").is_err(),
+        "levels outside the Cloud Code ladder must be rejected"
+    );
 }

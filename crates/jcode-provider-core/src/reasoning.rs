@@ -59,6 +59,10 @@ pub const DEEPSEEK_SELECTABLE_EFFORTS: &[&str] = &[
     "swarm-deep",
 ];
 
+/// Antigravity (Cloud Code) thinking levels. `none` disables thinking, which
+/// the backend expresses as an explicit zero thinking budget.
+pub const ANTIGRAVITY_SELECTABLE_EFFORTS: &[&str] = &["none", "low", "medium", "high"];
+
 /// Convert a provider-advertised OpenAI/OpenRouter effort into the canonical
 /// static value used by the provider trait.
 pub fn canonical_reasoning_effort(value: &str) -> Option<&'static str> {
@@ -86,6 +90,13 @@ pub fn inferred_reasoning_efforts(
 
     if provider.contains("openrouter") {
         return OPENROUTER_SELECTABLE_EFFORTS.to_vec();
+    }
+
+    // Antigravity is checked before the generic Gemini/Anthropic branches: its
+    // models carry Gemini and Claude names but expose the Cloud Code thinking
+    // ladder rather than the upstream provider vocabularies.
+    if provider.contains("antigravity") {
+        return ANTIGRAVITY_SELECTABLE_EFFORTS.to_vec();
     }
 
     if provider.contains("deepseek") || model.contains("deepseek") {

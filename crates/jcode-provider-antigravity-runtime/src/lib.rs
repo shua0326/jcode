@@ -13,8 +13,9 @@ use jcode_provider_antigravity::{
     GENERATE_CONTENT_ENDPOINT_CANDIDATES, PersistedCatalog, X_GOOG_API_CLIENT,
     antigravity_compatible_schema, antigravity_user_agent, catalog_is_stale, catalog_model_detail,
     client_metadata_header, is_retryable_empty_turn, merge_antigravity_model_ids,
-    remap_unsupported_model,
+    remap_unsupported_model, thinking_budget_for,
 };
+use jcode_provider_core::ANTIGRAVITY_SELECTABLE_EFFORTS;
 #[cfg(test)]
 use jcode_provider_antigravity::{
     flatten_schema_combiners, metadata_platform, model_is_claude, model_is_gemini,
@@ -68,6 +69,7 @@ fn antigravity_wire_request(
     system_instruction: Option<&Value>,
     tools: Option<&Value>,
     tool_config: Option<&Value>,
+    thinking: Option<&Value>,
     trajectory_id: &str,
     step_index: usize,
 ) -> serde_json::Map<String, Value> {
@@ -87,6 +89,9 @@ fn antigravity_wire_request(
     }
     if let Some(tool_config) = tool_config {
         inner.insert("toolConfig".to_string(), tool_config.clone());
+    }
+    if let Some(thinking) = thinking {
+        inner.insert("generationConfig".to_string(), json!({ "thinkingConfig": thinking }));
     }
     inner.insert(
         "labels".to_string(),
@@ -109,6 +114,8 @@ pub struct AntigravityProvider {
     /// Backend-advertised default agent model id (from `fetchAvailableModels`).
     /// Used to resolve the `"default"` alias to a real model for inference.
     backend_default_model: Arc<RwLock<Option<String>>>,
+    /// Active thinking level, sent as `generationConfig.thinkingConfig`.
+    reasoning_effort: Arc<RwLock<Option<String>>>,
 }
 
 impl Clone for AntigravityProvider {
@@ -118,6 +125,7 @@ impl Clone for AntigravityProvider {
             model: self.model.clone(),
             fetched_catalog: self.fetched_catalog.clone(),
             backend_default_model: self.backend_default_model.clone(),
+            reasoning_effort: self.reasoning_effort.clone(),
         }
     }
 }
@@ -159,6 +167,12 @@ impl AntigravityProvider {
             model: Arc::new(RwLock::new(model)),
             fetched_catalog: Arc::new(RwLock::new(Vec::new())),
             backend_default_model: Arc::new(RwLock::new(None)),
+            reasoning_effort: Arc::new(RwLock::new(
+                std::env::var("JCODE_ANTIGRAVITY_EFFORT")
+                    .ok()
+                    .map(|value| value.trim().to_string())
+                    .filter(|value| !value.is_empty()),
+            )),
         };
         provider.seed_cached_catalog();
         provider
@@ -485,12 +499,30 @@ impl AntigravityProvider {
             .tool_config
             .as_ref()
             .and_then(|config| serde_json::to_value(config).ok());
+        // The Cloud Code backend takes thinking as an explicit budget rather
+        // than the upstream vocabularies, so the session's thinking level is
+        // translated per model family. No stored effort means "leave it to the
+        // backend", which keeps the previous behavior for existing sessions.
+        let thinking = self
+            .reasoning_effort
+            .read()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .clone()
+            .and_then(|effort| {
+                thinking_budget_for(&request.model, &effort).map(|budget| {
+                    json!({
+                        "includeThoughts": false,
+                        "thinkingBudget": budget,
+                    })
+                })
+            });
         let inner = antigravity_wire_request(
             contents_value.clone(),
             request.request.session_id.as_deref(),
             system_value.as_ref(),
             tools_value.as_ref(),
             tool_config_value.as_ref(),
+            thinking.as_ref(),
             &trajectory_id,
             step_index,
         );
@@ -509,7 +541,7 @@ impl AntigravityProvider {
         // production host is the one most likely to be throttled.
         let mut last_failure: Option<anyhow::Error> = None;
         for endpoint in GENERATE_CONTENT_ENDPOINT_CANDIDATES {
-            let response = self
+            let response = match self
                 .client
                 .post(format!("{endpoint}/v1internal:generateContent"))
                 .bearer_auth(&tokens.access_token)
@@ -524,7 +556,28 @@ impl AntigravityProvider {
                 .json(&body)
                 .send()
                 .await
-                .context("Failed to send Antigravity generateContent request")?;
+            {
+                Ok(response) => response,
+                Err(error) => {
+                    // A host that cannot be reached (timeout, TLS failure, DNS)
+                    // must not end the cascade: the other hosts may still serve
+                    // the request.
+                    let mut chain = error.to_string();
+                    let mut source = std::error::Error::source(&error);
+                    while let Some(inner) = source {
+                        chain.push_str(" <- ");
+                        chain.push_str(&inner.to_string());
+                        source = inner.source();
+                    }
+                    jcode_base::logging::info(&format!(
+                        "Antigravity generateContent endpoint {endpoint} unreachable: {chain}"
+                    ));
+                    last_failure = Some(anyhow::anyhow!(
+                        "Failed to send Antigravity generateContent request to {endpoint}: {error}"
+                    ));
+                    continue;
+                }
+            };
 
             if response.status().is_success() {
                 jcode_base::logging::info(&format!(
@@ -921,6 +974,38 @@ impl Provider for AntigravityProvider {
         AVAILABLE_MODELS.to_vec()
     }
 
+    fn reasoning_effort(&self) -> Option<String> {
+        self.reasoning_effort
+            .read()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .clone()
+    }
+
+    fn set_reasoning_effort(&self, effort: &str) -> Result<()> {
+        let canonical = jcode_provider_core::canonical_reasoning_effort(effort)
+            .ok_or_else(|| {
+                anyhow::anyhow!(
+                    "Unsupported Antigravity thinking level '{effort}'. Available: {}",
+                    ANTIGRAVITY_SELECTABLE_EFFORTS.join(", ")
+                )
+            })?;
+        if !ANTIGRAVITY_SELECTABLE_EFFORTS.contains(&canonical) {
+            anyhow::bail!(
+                "Antigravity does not support thinking level '{canonical}'. Available: {}",
+                ANTIGRAVITY_SELECTABLE_EFFORTS.join(", ")
+            );
+        }
+        *self
+            .reasoning_effort
+            .write()
+            .unwrap_or_else(|poisoned| poisoned.into_inner()) = Some(canonical.to_string());
+        Ok(())
+    }
+
+    fn available_efforts(&self) -> Vec<&'static str> {
+        ANTIGRAVITY_SELECTABLE_EFFORTS.to_vec()
+    }
+
     fn available_models_display(&self) -> Vec<String> {
         let catalog = self.fetched_catalog();
         merge_antigravity_model_ids(
@@ -940,6 +1025,11 @@ impl Provider for AntigravityProvider {
         if !catalog.is_empty() {
             return catalog
                 .into_iter()
+                // Backend-internal chat handles (`chat_20706`) are not
+                // addressable models; listing them only produces failed turns.
+                .filter(|model| {
+                    jcode_provider_antigravity::is_selectable_antigravity_model(&model.id)
+                })
                 .map(|model| jcode_provider_core::ModelRoute {
                     model: model.id.clone(),
                     provider: "Antigravity".to_string(),
@@ -1030,6 +1120,7 @@ impl Provider for AntigravityProvider {
             model: Arc::new(RwLock::new(self.model())),
             fetched_catalog: self.fetched_catalog.clone(),
             backend_default_model: self.backend_default_model.clone(),
+            reasoning_effort: self.reasoning_effort.clone(),
         })
     }
 }

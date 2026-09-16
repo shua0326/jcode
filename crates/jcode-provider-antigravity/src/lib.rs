@@ -200,11 +200,86 @@ pub fn merge_antigravity_model_ids(models: impl IntoIterator<Item = String>) -> 
 
     let mut extras: Vec<String> = models
         .into_iter()
+        .filter(|model| is_selectable_antigravity_model(model))
         .filter(|model| seen.insert(model.clone()))
         .collect();
     extras.sort();
     preferred.extend(extras);
     preferred
+}
+
+/// Whether a backend-advertised id is a real selectable model.
+///
+/// `fetchAvailableModels` also returns internal ids that are not addressable as
+/// agent models: chat/session handles (`chat_20706`) and inline tab-completion
+/// models (`tab_flash_lite_preview`). Offering them in the picker only produces
+/// failed turns. Only this internal prefix set is dropped, so a model family
+/// the backend adds later still shows up.
+pub fn is_selectable_antigravity_model(id: &str) -> bool {
+    let id = id.trim();
+    if id.is_empty() {
+        return false;
+    }
+    let lower = id.to_ascii_lowercase();
+    !["chat_", "chat-", "tab_", "tab-"]
+        .iter()
+        .any(|prefix| lower.starts_with(prefix))
+}
+
+/// Thinking budget for a model at a given effort, mirroring the Antigravity CLI
+/// mapping.
+///
+/// `None` means "send no thinking config", either because the model has no
+/// thinking control or because the effort is `none`. Sending an explicit zero
+/// budget is rejected by the backend ("Budget 0 is invalid. This model only
+/// works in thinking mode."), so disabling thinking is left to the backend's
+/// own default for the model.
+///
+/// Thoughts themselves stay out of the response: requesting them
+/// (`includeThoughts: true`) makes the backend return the model's reasoning as
+/// regular answer text on these models, which then leaks into the transcript.
+pub fn thinking_budget_for(model: &str, effort: &str) -> Option<i64> {
+    let model = model.trim().to_ascii_lowercase();
+    let effort = effort.trim().to_ascii_lowercase();
+    let off = effort.is_empty() || effort == "none" || effort == "off";
+    if off {
+        return None;
+    }
+    let strong = effort == "high" || effort == "xhigh" || effort == "max";
+
+    if model.starts_with("claude-") {
+        return Some(1024);
+    }
+    if model.starts_with("gpt-oss-") {
+        return Some(8192);
+    }
+    if model.starts_with("gemini-3.5-flash") || model.starts_with("gemini-3-flash-agent") {
+        let budget = if strong {
+            10_000
+        } else if effort == "medium" {
+            4_000
+        } else {
+            1_000
+        };
+        return Some(budget);
+    }
+    if model.starts_with("gemini-3.1-pro") || model.starts_with("gemini-pro-agent") {
+        let budget = if strong { 10_001 } else { 1_001 };
+        return Some(budget);
+    }
+    if model.starts_with("gemini-") {
+        // `-1` lets the model spend thinking tokens dynamically.
+        let budget = if strong {
+            -1
+        } else if effort == "medium" {
+            4_000
+        } else {
+            1_000
+        };
+        return Some(budget);
+    }
+
+    None
 }
 
 pub fn is_known_model(model: &str) -> bool {
@@ -643,5 +718,43 @@ mod tests {
             *GENERATE_CONTENT_ENDPOINT_CANDIDATES.last().unwrap(),
             "https://cloudcode-pa.googleapis.com"
         );
+    }
+    #[test]
+    fn selectable_models_exclude_internal_chat_ids() {
+        assert!(is_selectable_antigravity_model("gemini-3.1-pro-high"));
+        assert!(is_selectable_antigravity_model("claude-opus-4-6-thinking"));
+        assert!(is_selectable_antigravity_model("gpt-oss-120b-medium"));
+        // Unknown families stay visible: only internal handles are dropped.
+        assert!(is_selectable_antigravity_model("custom-antigravity-model"));
+        assert!(!is_selectable_antigravity_model("chat_20706"));
+        assert!(!is_selectable_antigravity_model("tab_flash_lite_preview"));
+        assert!(!is_selectable_antigravity_model("tab_jump_flash_lite_preview"));
+        assert!(!is_selectable_antigravity_model(""));
+    }
+
+    #[test]
+    fn merge_drops_backend_chat_ids_from_the_picker_list() {
+        let merged = merge_antigravity_model_ids(vec![
+            "chat_20706".to_string(),
+            "gemini-3.1-pro-high".to_string(),
+            "chat_23310".to_string(),
+        ]);
+        assert!(merged.contains(&"gemini-3.1-pro-high".to_string()));
+        assert!(!merged.iter().any(|id| id.starts_with("chat_")));
+    }
+
+    #[test]
+    fn thinking_budgets_match_the_antigravity_cli_mapping() {
+        // The backend rejects an explicit zero budget, so `none` sends nothing.
+        assert_eq!(thinking_budget_for("gemini-3.1-pro-high", "none"), None);
+        assert_eq!(thinking_budget_for("gemini-3.1-pro-high", ""), None);
+        assert_eq!(thinking_budget_for("gemini-3.1-pro-high", "low"), Some(1_001));
+        assert_eq!(thinking_budget_for("gemini-3.1-pro-high", "high"), Some(10_001));
+        assert_eq!(thinking_budget_for("gemini-3.5-flash-low", "medium"), Some(4_000));
+        assert_eq!(thinking_budget_for("gemini-3.5-flash-low", "high"), Some(10_000));
+        assert_eq!(thinking_budget_for("claude-opus-4-6-thinking", "high"), Some(1024));
+        assert_eq!(thinking_budget_for("gpt-oss-120b-medium", "low"), Some(8192));
+        assert_eq!(thinking_budget_for("gemini-2.5-flash", "high"), Some(-1));
+        assert_eq!(thinking_budget_for("mystery-model", "high"), None);
     }
 }
