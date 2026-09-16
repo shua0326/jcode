@@ -330,7 +330,10 @@ impl App {
                                                 content_blocks.push(ContentBlock::ToolUse {
                                                     id: tc.id.clone(),
                                                     name: tc.name.clone(),
-                                                    input: tc.input.clone(), thought_signature: None, });
+                                                    input: tc.input.clone(),
+                                                    // Preserve Gemini's signed function call for replay.
+                                                    thought_signature: tc.thought_signature.clone(),
+                                                });
                                             }
                                             if !content_blocks.is_empty() {
                                                 let content_clone = content_blocks.clone();
@@ -398,7 +401,10 @@ impl App {
                                                 content_blocks.push(ContentBlock::ToolUse {
                                                     id: tc.id.clone(),
                                                     name: tc.name.clone(),
-                                                    input: tc.input.clone(), thought_signature: None, });
+                                                    input: tc.input.clone(),
+                                                    // Preserve Gemini's signed function call for replay.
+                                                    thought_signature: tc.thought_signature.clone(),
+                                                });
                                             }
                                             // Add partial assistant response to messages
                                             if !content_blocks.is_empty() {
@@ -1084,7 +1090,8 @@ impl App {
                     id: tc.id.clone(),
                     name: tc.name.clone(),
                     input: tc.input.clone(),
-                    thought_signature: None,
+                    // Preserve Gemini's signed function call for replay.
+                    thought_signature: tc.thought_signature.clone(),
                 });
             }
 

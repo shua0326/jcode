@@ -1093,7 +1093,12 @@ impl Agent {
                     id: tc.id.clone(),
                     name: tc.name.clone(),
                     input: tc.input.clone(),
-                    thought_signature: None,
+                    // Gemini 3 signs its function calls and the Cloud Code backend
+                    // rejects a replay of unsigned ones ("Function call is missing
+                    // a thought_signature"), so persist what the stream captured.
+                    // Dropping it here broke every multi-turn Antigravity tool
+                    // loop on the daemon/ACP path.
+                    thought_signature: tc.thought_signature.clone(),
                 });
             }
 

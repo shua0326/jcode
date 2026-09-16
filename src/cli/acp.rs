@@ -18,7 +18,11 @@ const JSONRPC_INVALID_REQUEST: i64 = -32600;
 const JSONRPC_METHOD_NOT_FOUND: i64 = -32601;
 const JSONRPC_INVALID_PARAMS: i64 = -32602;
 const JSONRPC_INTERNAL_ERROR: i64 = -32603;
-const JSONRPC_SERVER_ERROR: i64 = -32000;
+// NOTE: `-32000` is reserved by ACP for `AuthRequired`, whose client-facing
+// string is "Authentication required". Never return it for ordinary turn or
+// provider failures: clients (Zed) render it as an authentication prompt, so a
+// crashed model turn looked like an expired login and sent users chasing auth.
+// Every failure below is an internal error, not an authentication request.
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub(crate) enum AcpProfile {
@@ -679,7 +683,7 @@ impl AcpRuntime {
         {
             self.write_error_value(
                 id,
-                JSONRPC_SERVER_ERROR,
+                JSONRPC_INTERNAL_ERROR,
                 format!("Session {session_id} is already processing a prompt"),
             )
             .await?;
@@ -801,7 +805,7 @@ impl AcpRuntime {
         if session.prompt_running.load(Ordering::SeqCst) {
             self.write_error_value(
                 id,
-                JSONRPC_SERVER_ERROR,
+                JSONRPC_INTERNAL_ERROR,
                 format!("Session {session_id} is processing a prompt; retry when it finishes"),
             )
             .await?;
@@ -845,7 +849,7 @@ impl AcpRuntime {
             Err(err) => {
                 self.write_error_value(
                     id,
-                    JSONRPC_SERVER_ERROR,
+                    JSONRPC_INVALID_PARAMS,
                     format!("Failed to set {config_id}: {err:#}"),
                 )
                 .await?;
@@ -1475,7 +1479,7 @@ impl AcpRuntime {
                 }
                 ServerEvent::Error { id, message, .. } if id == prompt_id => {
                     cleanup_prompt_state(&session).await;
-                    self.write_error_value(rpc_id, JSONRPC_SERVER_ERROR, message)
+                    self.write_error_value(rpc_id, JSONRPC_INTERNAL_ERROR, message)
                         .await?;
                     return Ok(());
                 }

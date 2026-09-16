@@ -591,8 +591,13 @@ impl AntigravityProvider {
 
             let status = response.status();
             let body_text = jcode_base::util::http_error_body(response, "HTTP error").await;
+            // Surface what the backend objected to. A bare "returned HTTP 400"
+            // says nothing about which part of the request was rejected, and the
+            // body is the only place the backend explains itself (missing
+            // thought_signature, invalid schema construct, bad model id, ...).
+            let excerpt: String = body_text.trim().chars().take(400).collect();
             jcode_base::logging::info(&format!(
-                "Antigravity generateContent endpoint {endpoint} returned HTTP {status}"
+                "Antigravity generateContent endpoint {endpoint} returned HTTP {status}: {excerpt}"
             ));
             last_failure = Some(anyhow::anyhow!(
                 "Antigravity generateContent failed (HTTP {}): {}",
