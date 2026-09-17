@@ -97,6 +97,7 @@ impl Agent {
         let mut context_limit_retries = 0u32;
         let mut incomplete_continuations = 0u32;
         let mut empty_post_tool_continuations = 0u32;
+        let mut dropped_stream_retries = 0u32;
         let mut fable_guardrail_reconsiderations = 0u32;
 
         loop {
@@ -1171,6 +1172,25 @@ impl Agent {
             // Injecting before tool_results would break the API requirement that
             // tool_use must be immediately followed by tool_result.
             if tool_calls.is_empty() {
+                // A stream that closes without its completion marker, on a turn
+                // the user did not cancel, was dropped by the provider or its
+                // gateway instead of being finished by the model. Nothing was
+                // streamed or persisted in that case, so re-issuing the same
+                // request is safe; without it the turn ended as a silently
+                // empty answer (observed with OpenCode Go's `union-alpha`).
+                let stream_dropped = !saw_message_end && !self.is_graceful_shutdown();
+                if stream_dropped
+                    && text_content.trim().is_empty()
+                    && dropped_stream_retries < Self::MAX_DROPPED_STREAM_RETRIES
+                {
+                    dropped_stream_retries += 1;
+                    logging::warn(&format!(
+                        "Provider stream ended without a completion marker and delivered no output; retrying the request (attempt {}/{})",
+                        dropped_stream_retries,
+                        Self::MAX_DROPPED_STREAM_RETRIES
+                    ));
+                    continue;
+                }
                 if saw_message_end
                     && !self.is_graceful_shutdown()
                     && self.maybe_reconsider_fable_guardrail(
@@ -1203,9 +1223,10 @@ impl Agent {
                         // ended the turn with no visible output (e.g. Anthropic
                         // stop_reason "refusal", or a reasoning-only response).
                         // Only when the provider actually finished the message
-                        // (saw_message_end) and the user did not cancel, so
+                        // (saw_message_end) or the stream was dropped before it
+                        // said anything, and the user did not cancel, so
                         // interrupted turns never show a spurious notice.
-                        if saw_message_end
+                        if (saw_message_end || stream_dropped)
                             && !self.is_graceful_shutdown()
                             && let Some(notice) = Self::provider_guardrail_notice(
                                 stop_reason.as_deref(),

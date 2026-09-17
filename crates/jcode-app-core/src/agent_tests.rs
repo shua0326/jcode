@@ -2127,6 +2127,128 @@ async fn stranded_tool_use_stop_continues_instead_of_ending_the_turn() {
     );
 }
 
+/// Provider that closes the response stream without sending a single event,
+/// which is what OpenCode Go's `union-alpha` does under load: the gateway
+/// accepts the request, opens the SSE stream, sends nothing, and closes
+/// ~20-35s later with no completion marker and no tokens. The agent loop must
+/// retry the identical request instead of ending the turn with an empty answer.
+#[derive(Clone, Default)]
+struct DroppedStreamProvider {
+    calls: Arc<std::sync::Mutex<usize>>,
+    /// How many leading calls drop the stream before the model answers.
+    drops: usize,
+}
+
+#[async_trait]
+impl Provider for DroppedStreamProvider {
+    async fn complete(
+        &self,
+        _messages: &[Message],
+        _tools: &[ToolDefinition],
+        _system: &str,
+        _resume_session_id: Option<&str>,
+    ) -> Result<EventStream> {
+        let call = {
+            let mut guard = self.calls.lock().unwrap();
+            *guard += 1;
+            *guard
+        };
+        let drops = self.drops;
+        let (tx, rx) = tokio_mpsc::channel::<Result<StreamEvent>>(8);
+        tokio::spawn(async move {
+            if call <= drops {
+                // Open the stream and close it with no events at all.
+                drop(tx);
+                return;
+            }
+            let _ = tx
+                .send(Ok(StreamEvent::TextDelta("recovered answer".to_string())))
+                .await;
+            let _ = tx
+                .send(Ok(StreamEvent::MessageEnd {
+                    stop_reason: Some("end_turn".to_string()),
+                }))
+                .await;
+        });
+        Ok(Box::pin(ReceiverStream::new(rx)))
+    }
+
+    fn name(&self) -> &str {
+        "dropped-stream"
+    }
+
+    fn fork(&self) -> Arc<dyn Provider> {
+        Arc::new(self.clone())
+    }
+}
+
+/// Before the fix the daemon treated the empty stream as a finished turn:
+/// `Turn complete - no tool calls` with no output, which is exactly the
+/// "union-alpha stopped after some tool calls" report. A retry must re-issue
+/// the request and deliver the real answer.
+#[tokio::test]
+async fn dropped_stream_is_retried_instead_of_ending_the_turn_empty() {
+    let _guard = crate::storage::lock_test_env();
+    let dropped = DroppedStreamProvider {
+        calls: Arc::default(),
+        drops: 1,
+    };
+    let calls = dropped.calls.clone();
+    let provider: Arc<dyn Provider> = Arc::new(dropped);
+    let registry = Registry::new(provider.clone()).await;
+    let mut agent = Agent::new(provider, registry);
+
+    let (tx, mut rx) = tokio::sync::mpsc::unbounded_channel();
+    agent
+        .run_once_streaming_mpsc("do the task", Vec::new(), None, tx)
+        .await
+        .expect("turn should complete");
+
+    let mut text = String::new();
+    while let Ok(event) = rx.try_recv() {
+        if let ServerEvent::TextDelta { text: delta } = event {
+            text.push_str(&delta);
+        }
+    }
+
+    assert_eq!(
+        *calls.lock().unwrap(),
+        2,
+        "a dropped stream must be retried once before the turn ends"
+    );
+    assert!(
+        text.contains("recovered answer"),
+        "the retry must deliver the model's real answer, got {text:?}"
+    );
+}
+
+/// A gateway that keeps dropping streams must not keep the turn (and its API
+/// spend) alive: the retry budget is bounded per turn.
+#[tokio::test]
+async fn dropped_stream_retries_are_bounded() {
+    let _guard = crate::storage::lock_test_env();
+    let dropped = DroppedStreamProvider {
+        calls: Arc::default(),
+        drops: usize::MAX,
+    };
+    let calls = dropped.calls.clone();
+    let provider: Arc<dyn Provider> = Arc::new(dropped);
+    let registry = Registry::new(provider.clone()).await;
+    let mut agent = Agent::new(provider, registry);
+
+    let (tx, _rx) = tokio::sync::mpsc::unbounded_channel();
+    agent
+        .run_once_streaming_mpsc("do the task", Vec::new(), None, tx)
+        .await
+        .expect("turn should end after the retry budget is spent");
+
+    assert_eq!(
+        *calls.lock().unwrap() as u32,
+        1 + Agent::MAX_DROPPED_STREAM_RETRIES,
+        "the dropped-stream retry budget must be bounded"
+    );
+}
+
 #[derive(Clone, Default)]
 struct FableGuardrailProvider {
     calls: Arc<std::sync::Mutex<usize>>,

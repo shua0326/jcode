@@ -2371,6 +2371,13 @@ impl EventMapper {
             ServerEvent::ReasoningDone { .. } => Vec::new(),
             ServerEvent::TextDelta { text } => vec![agent_message_chunk(text)],
             ServerEvent::TextReplace { text } => vec![agent_message_chunk(text)],
+            // The turn loop explains a turn that ended with no visible output
+            // (a dropped upstream stream, or a provider guardrail refusal).
+            // Editors have no other channel for it, so an empty turn would
+            // otherwise look like the agent silently did nothing.
+            ServerEvent::ProviderGuardrail { message, .. } => vec![agent_message_chunk(format!(
+                "\n[provider] {message}\n"
+            ))],
             ServerEvent::ToolStart { id, name } => {
                 self.current_tool_id = Some(id.clone());
                 self.tool_inputs.entry(id.clone()).or_default();
@@ -3589,6 +3596,25 @@ mod tests {
     fn session_listing_rejects_invalid_filters_and_cursor() {
         assert!(acp_session_list(&json!({"cwd":"relative"}), Vec::new()).is_err());
         assert!(acp_session_list(&json!({"cursor":"bad"}), Vec::new()).is_err());
+    }
+
+    #[test]
+    fn empty_turn_notice_reaches_the_editor_as_agent_text() {
+        // A turn that ends with no visible output (dropped upstream stream,
+        // guardrail refusal) has no other channel to the editor; without this
+        // mapping the user sees the turn end silently.
+        let mut mapper = EventMapper::new("test".into(), AcpProfile::Standard);
+        let updates = mapper.map_event(ServerEvent::ProviderGuardrail {
+            stop_reason: None,
+            message: "The provider returned an empty response.".into(),
+        });
+        assert_eq!(updates.len(), 1);
+        assert_eq!(updates[0]["sessionUpdate"], "agent_message_chunk");
+        let text = updates[0]["content"]["text"].as_str().unwrap();
+        assert!(
+            text.contains("The provider returned an empty response."),
+            "the notice text must survive, got {text:?}"
+        );
     }
 
     #[test]

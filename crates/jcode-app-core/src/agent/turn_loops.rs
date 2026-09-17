@@ -27,6 +27,13 @@ impl Agent {
     /// task half-done. The counter is per turn-loop, so a genuinely finished
     /// agent still exits promptly.
     pub(crate) const MAX_EMPTY_POST_TOOL_CONTINUATION_ATTEMPTS: u32 = 5;
+    /// Retries allowed when the provider stream closes without its completion
+    /// marker and never delivered a single event. Gateways do this under load:
+    /// OpenCode Go's `union-alpha` accepts the request, opens the stream, sends
+    /// nothing, and closes ~20-35s later. Nothing reached the client or the
+    /// history, so re-issuing the identical request is safe, and without the
+    /// retry the turn ended as a silently empty answer.
+    pub(crate) const MAX_DROPPED_STREAM_RETRIES: u32 = 3;
     const SEQUENTIAL_TOOL_ROUNDS_BEFORE_BATCH_NUDGE: u32 = 3;
     const BATCH_NUDGE: &str = "<system-reminder>Several tool calls have been made one at a time. If the next independent operations can run concurrently, use the batch tool instead of making more sequential calls. Keep sequential calls when one result is required to decide the next operation.</system-reminder>";
 
