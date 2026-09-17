@@ -225,6 +225,17 @@ impl SessionUiState {
             })
             .unwrap_or(crate::provider::DEFAULT_CONTEXT_LIMIT) as u64
     }
+
+    /// Context meter payload for the active conversation: the last observed
+    /// prompt+output token count paired with the *current* model's window.
+    ///
+    /// `None` until a turn has reported usage. A conversation that has never
+    /// reported tokens has nothing to show, and reporting `0` would claim the
+    /// context is empty.
+    fn context_usage(&self) -> Option<(u64, u64)> {
+        self.last_context_tokens
+            .map(|used| (used, self.context_limit()))
+    }
 }
 
 impl DaemonSession {
@@ -845,6 +856,12 @@ impl AcpRuntime {
                     }),
                 )
                 .await?;
+                // `set_acp_model` consumes the daemon's ModelChanged event while
+                // waiting for the switch, so this is the only place that can tell
+                // the editor its context meter just changed models.
+                if config_id == CONFIG_ID_MODEL {
+                    let _ = self.write_usage_update(&session).await;
+                }
             }
             Err(err) => {
                 self.write_error_value(
@@ -1029,7 +1046,7 @@ impl AcpRuntime {
                         cache_read_input,
                         cache_creation_input,
                     } => {
-                        let (used, size) = {
+                        {
                             let mut state = active.ui_state.lock().await;
                             let full = acp_full_input_tokens(
                                 state.provider_name.as_deref().unwrap_or_default(),
@@ -1047,11 +1064,9 @@ impl AcpRuntime {
                                 cache_creation_input,
                             );
                             state.usage_reports += 1;
-                            let used = full.saturating_add(output);
-                            state.last_context_tokens = Some(used);
-                            (used, state.context_limit())
-                        };
-                        let _ = runtime.write_notification("session/update", json!({"sessionId":active.session_id,"update":{"sessionUpdate":"usage_update","used":used,"size":size}})).await;
+                            state.last_context_tokens = Some(full.saturating_add(output));
+                        }
+                        let _ = runtime.write_usage_update(&active).await;
                         if active.prompt_running.load(Ordering::SeqCst) {
                             let _ = tx.send(Ok(event)).await;
                         }
@@ -1089,6 +1104,9 @@ impl AcpRuntime {
                                     }
                                 }
                                 let _ = runtime.write_config_option_update(&active).await;
+                                // The new model has a different window, so the
+                                // meter would keep the old denominator otherwise.
+                                let _ = runtime.write_usage_update(&active).await;
                             }
                         }
                         if tx.send(Ok(event)).await.is_err() {
@@ -1116,6 +1134,9 @@ impl AcpRuntime {
                             }
                         }
                         let _ = runtime.write_config_option_update(&active).await;
+                        // This event can also resolve a different provider/model
+                        // for the session, which moves the context window.
+                        let _ = runtime.write_usage_update(&active).await;
                     }
                     ServerEvent::Notification {
                         from_session,
@@ -1687,6 +1708,30 @@ impl AcpRuntime {
                 "update": {
                     "sessionUpdate": "config_option_update",
                     "configOptions": config_options,
+                }
+            }),
+        )
+        .await
+    }
+
+    /// Report the active context meter to the editor.
+    ///
+    /// The meter's denominator is the current model's window, so anything that
+    /// can change the active model or provider has to re-report it. Only the
+    /// turn-level token event used to, which left the meter showing the previous
+    /// model's window until the next turn finished.
+    async fn write_usage_update(&self, session: &DaemonSession) -> Result<()> {
+        let Some((used, size)) = session.ui_state.lock().await.context_usage() else {
+            return Ok(());
+        };
+        self.write_notification(
+            "session/update",
+            json!({
+                "sessionId": session.session_id,
+                "update": {
+                    "sessionUpdate": "usage_update",
+                    "used": used,
+                    "size": size,
                 }
             }),
         )
@@ -4031,6 +4076,37 @@ mod tests {
             state.context_limit(),
             crate::provider::DEFAULT_CONTEXT_LIMIT as u64
         );
+    }
+
+    #[test]
+    fn context_usage_denominator_follows_the_active_model() {
+        let mut state = SessionUiState {
+            provider_name: Some("OpenAI".to_string()),
+            model: Some("gpt-5.6-sol".to_string()),
+            last_context_tokens: Some(167_000),
+            ..SessionUiState::default()
+        };
+        assert_eq!(state.context_usage(), Some((167_000, 272_000)));
+
+        // The same conversation on a wider model must report the wider window,
+        // which is what an editor's context meter divides the usage by.
+        state.provider_name = Some("OpenCode Go".to_string());
+        state.model = Some("muse-spark-1.3-contributor".to_string());
+        assert_eq!(state.context_usage(), Some((167_000, 1_048_576)));
+    }
+
+    #[test]
+    fn context_usage_is_absent_until_a_turn_reports_tokens() {
+        // Reporting `0` would claim an empty context, so a session that has
+        // never seen usage stays silent no matter how the model changes.
+        let mut state = SessionUiState {
+            provider_name: Some("OpenAI".to_string()),
+            model: Some("gpt-5.6-sol".to_string()),
+            ..SessionUiState::default()
+        };
+        assert_eq!(state.context_usage(), None);
+        state.model = Some("muse-spark-1.3-contributor".to_string());
+        assert_eq!(state.context_usage(), None);
     }
 
     #[cfg(unix)]
