@@ -101,6 +101,17 @@ pub fn build_responses_input(messages: &[ChatMessage]) -> Vec<Value> {
     build_responses_input_with_logger(messages, |_, _| {})
 }
 
+/// OpenAI validates replayed item ids as letters, digits, `_` or `-`, and
+/// rejects anything else with `invalid_value` on `input[N].id`. Aggregator
+/// gateways may namespace their ids ("rs_ab:rs_cd"); those ids are not valid
+/// OpenAI Responses input items and must not cross this serialization boundary.
+fn is_openai_replayable_item_id(id: &str) -> bool {
+    !id.is_empty()
+        && id
+            .chars()
+            .all(|c| c.is_ascii_alphanumeric() || c == '_' || c == '-')
+}
+
 pub fn build_responses_input_with_logger(
     messages: &[ChatMessage],
     mut logger: impl FnMut(OpenAiRequestLogLevel, &str),
@@ -125,6 +136,7 @@ pub fn build_responses_input_with_logger(
     let mut skipped_results = 0usize;
     let mut delayed_results = 0usize;
     let mut injected_missing = 0usize;
+    let mut skipped_reasoning = 0usize;
 
     for (idx, msg) in messages.iter().enumerate() {
         match msg.role {
@@ -239,6 +251,13 @@ pub fn build_responses_input_with_logger(
                             encrypted_content,
                             ..
                         } => {
+                            // Reasoning state from another provider (a gateway's
+                            // namespaced id, or a foreign encrypted blob) is
+                            // unusable here and would fail the whole request.
+                            if !is_openai_replayable_item_id(id) {
+                                skipped_reasoning += 1;
+                                continue;
+                            }
                             let mut item = serde_json::json!({
                                 "type": "reasoning",
                                 "id": id,
@@ -381,6 +400,15 @@ pub fn build_responses_input_with_logger(
             &format!(
                 "[openai] Filtered {} orphaned tool result(s) to prevent API error",
                 skipped_results
+            ),
+        );
+    }
+    if skipped_reasoning > 0 {
+        logger(
+            OpenAiRequestLogLevel::Info,
+            &format!(
+                "[openai] Filtered {} reasoning item(s) with ids OpenAI cannot replay",
+                skipped_reasoning
             ),
         );
     }
@@ -652,6 +680,31 @@ mod tests {
             items[0]["summary"],
             json!([{ "type": "summary_text", "text": "Checked constraints." }])
         );
+    }
+
+    #[test]
+    fn build_responses_input_drops_foreign_namespaced_reasoning_ids() {
+        let messages = vec![ChatMessage {
+            role: Role::Assistant,
+            content: vec![ContentBlock::OpenAIReasoning {
+                id: "rs_gateway:rs_upstream".to_string(),
+                summary: vec!["Gateway reasoning.".to_string()],
+                encrypted_content: Some("foreign_encrypted_reasoning".to_string()),
+                status: Some("completed".to_string()),
+            }],
+            timestamp: None,
+            tool_duration_ms: None,
+        }];
+        let mut logs = Vec::new();
+
+        let items = build_responses_input_with_logger(&messages, |level, message| {
+            logs.push((level, message.to_string()));
+        });
+
+        assert!(items.is_empty());
+        assert!(logs.iter().any(|(level, message)| {
+            *level == OpenAiRequestLogLevel::Info && message.contains("Filtered 1 reasoning item")
+        }));
     }
 
     /// Integration-level regression test for issue #687: the payload actually
