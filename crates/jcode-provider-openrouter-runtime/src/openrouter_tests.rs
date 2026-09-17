@@ -1614,6 +1614,130 @@ fn opencode_go_muse_exposes_documented_reasoning_efforts() {
     assert!(provider.set_reasoning_effort("max").is_err());
 }
 
+/// Write the models.dev capability cache the way a catalog fetch would, so the
+/// runtime's published-metadata lookups resolve without network access.
+fn save_models_dev_capability(provider: &str, model: &str, wire_api: &str, reasoning: bool) {
+    let cache_dir = jcode_base::storage::jcode_dir()
+        .expect("jcode dir")
+        .join("cache");
+    std::fs::create_dir_all(&cache_dir).expect("create cache dir");
+    let payload = serde_json::json!({
+        "schema_version": 2,
+        "cached_at_unix_secs": std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .expect("clock")
+            .as_secs(),
+        "providers": {},
+        "capabilities": {
+            provider: {
+                model: {
+                    "wire_api": wire_api,
+                    "reasoning": reasoning,
+                }
+            }
+        }
+    });
+    std::fs::write(
+        cache_dir.join("models_dev_pricing.json"),
+        serde_json::to_string(&payload).expect("serialize capability cache"),
+    )
+    .expect("write capability cache");
+}
+
+/// OpenCode Go serves `union-alpha` through the Anthropic Messages API; sending
+/// `chat/completions` returns a bare HTTP 500. The catalog publishes that mapping
+/// (`provider.npm = @ai-sdk/anthropic`), so the runtime must follow it, switch
+/// auth to `x-api-key`, and expose the model's thinking ladder.
+#[test]
+fn opencode_go_union_alpha_uses_the_messages_api() {
+    let _lock = ENV_LOCK.lock();
+    let temp = TempDir::new().expect("create temp home");
+    let jcode_home = temp.path().join("jcode-home");
+    let _jcode_home = EnvVarGuard::set("JCODE_HOME", &jcode_home);
+    let _home = EnvVarGuard::set("HOME", temp.path());
+    let _env = isolate_openrouter_autodetect_env();
+    save_models_dev_capability("opencode-go", "union-alpha", "anthropic-messages", true);
+
+    let (api_base, request_rx) = spawn_single_response_chat_server();
+    let provider = OpenRouterProvider {
+        api_base,
+        model: Arc::new(RwLock::new("union-alpha".to_string())),
+        profile_id: Some("opencode-go".to_string()),
+        supports_provider_features: false,
+        supports_model_catalog: false,
+        ..make_custom_compatible_provider()
+    };
+
+    // The published ladder (no explicit enum, Messages wire + reasoning) is
+    // jcode's budget ladder, so the picker offers levels instead of nothing.
+    assert_eq!(provider.available_efforts(), vec!["low", "medium", "high"]);
+    provider
+        .set_reasoning_effort("high")
+        .expect("union-alpha should accept its published effort");
+
+    let messages = vec![Message {
+        role: Role::User,
+        content: vec![ContentBlock::Text {
+            text: "hello".to_string(),
+            cache_control: None,
+        }],
+        timestamp: None,
+        tool_duration_ms: None,
+    }];
+    let tools = vec![ToolDefinition {
+        name: "read".to_string(),
+        description: "Read a file".to_string(),
+        input_schema: serde_json::json!({
+            "type": "object",
+            "properties": {"path": {"type": "string"}},
+            "required": ["path"]
+        }),
+    }];
+
+    let rt = tokio::runtime::Builder::new_current_thread()
+        .enable_all()
+        .build()
+        .expect("runtime");
+    rt.block_on(async {
+        let mut stream = provider
+            .complete(&messages, &tools, "system prompt", None)
+            .await
+            .expect("Messages request should start");
+        while let Some(event) = stream.next().await {
+            event.expect("Messages stream event should parse");
+        }
+    });
+
+    let request = request_rx
+        .recv_timeout(Duration::from_secs(2))
+        .expect("capture fake provider request");
+    assert!(
+        request.starts_with("POST /v1/messages "),
+        "union-alpha must use the Messages endpoint: {request}"
+    );
+    assert!(
+        request.to_ascii_lowercase().contains("x-api-key: test"),
+        "Messages wire must authenticate with x-api-key: {request}"
+    );
+    assert!(
+        request.to_ascii_lowercase().contains("anthropic-version:"),
+        "Messages wire must send anthropic-version: {request}"
+    );
+    let body = parse_captured_request_body(&request);
+    assert!(
+        body.get("max_tokens").is_some(),
+        "Messages requests require max_tokens: {body}"
+    );
+    assert_eq!(body["system"][0]["text"], "system prompt");
+    assert_eq!(body["tools"][0]["name"], "read");
+    assert!(body["tools"][0].get("input_schema").is_some());
+    assert_eq!(body["thinking"]["budget_tokens"], 16_384);
+    assert!(
+        body.get("tools").is_some() && body.get("messages").is_some(),
+        "Messages body must carry the conversation and tools: {body}"
+    );
+}
+
 #[test]
 fn opencode_go_muse_request_uses_responses_api() {
     let (api_base, request_rx) = spawn_single_response_chat_server();

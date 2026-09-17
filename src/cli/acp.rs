@@ -2154,14 +2154,23 @@ async fn set_acp_model(session: &DaemonSession, id: u64, value: &str) -> Result<
 }
 
 fn available_efforts(state: &SessionUiState) -> Vec<&'static str> {
-    crate::provider::inferred_reasoning_efforts(
-        state.provider_name.as_deref(),
-        state.model.as_deref(),
-    )
-    .into_iter()
-    // `swarm`/`swarm-deep` are TUI sentinels, not provider effort levels.
-    .filter(|effort| !effort.starts_with("swarm"))
-    .collect()
+    let provider_name = state.provider_name.as_deref();
+    let model = state.model.as_deref();
+    let inferred = crate::provider::inferred_reasoning_efforts(provider_name, model).into_iter();
+    // Name heuristics first so existing providers' ladders do not change, then
+    // the ladder the model catalog publishes. The catalog is what gives
+    // gateway-only models (OpenCode Go `union-alpha`) selectable levels.
+    let efforts: Vec<&'static str> = inferred
+        // `swarm`/`swarm-deep` are TUI sentinels, not provider effort levels.
+        .filter(|effort| !effort.starts_with("swarm"))
+        .collect();
+    if !efforts.is_empty() {
+        return efforts;
+    }
+    match (provider_name, model) {
+        (Some(provider), Some(model)) => crate::model_pricing::discovered_efforts(provider, model),
+        _ => Vec::new(),
+    }
 }
 
 /// Build the ACP `configOptions` array (model selector plus reasoning effort)

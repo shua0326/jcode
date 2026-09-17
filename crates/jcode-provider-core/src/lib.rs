@@ -13,9 +13,11 @@ pub mod reasoning;
 pub mod retry_after;
 pub mod selection;
 pub mod transport;
+pub mod wire_api;
 
-pub use transport::is_transient_transport_error;
 pub use jcode_usage_types::{ModelUsage, compare_model_usage};
+pub use transport::is_transient_transport_error;
+pub use wire_api::{WireApi, normalize_published_effort, wire_api_for_npm};
 
 pub use anthropic::{
     ANTHROPIC_OAUTH_BETA_HEADERS, ANTHROPIC_OAUTH_BETA_HEADERS_1M, AnthropicContextMode,

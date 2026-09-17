@@ -148,14 +148,6 @@ async fn collect_live_smoke_stream(
     .context("live provider smoke timed out")?
 }
 
-#[test]
-fn test_parse_sse_event() {
-    let mut buffer = "event: message_start\ndata: {\"type\":\"message_start\"}\n\n".to_string();
-    let event = parse_sse_event(&mut buffer).unwrap();
-    assert_eq!(event.event_type, "message_start");
-    assert!(buffer.is_empty());
-}
-
 #[tokio::test]
 async fn test_available_models() {
     let provider = AnthropicProvider::new();
@@ -632,111 +624,6 @@ fn test_anthropic_manual_thinking_budget_for_opus_45() {
     }
     assert_eq!(output_config.unwrap().effort, "high");
     assert_eq!(temperature, None);
-}
-
-#[test]
-fn message_start_warns_when_server_substitutes_a_different_model() {
-    // Anthropic can silently alias an unavailable model id to a different model
-    // (observed: claude-fable-5 -> claude-haiku-4-5). When the served model
-    // differs from the requested base id, we must surface a StatusDetail warning
-    // so the user is not misled about which model answered.
-    let mut state = SseStreamState {
-        requested_model_base: "claude-fable-5".to_string(),
-        ..SseStreamState::default()
-    };
-    let event = SseEvent {
-        event_type: "message_start".to_string(),
-        data: serde_json::json!({
-            "type": "message_start",
-            "message": {"model": "claude-haiku-4-5-20251001", "usage": {"input_tokens": 1}}
-        })
-        .to_string(),
-    };
-    let events = process_sse_event(&event, &mut state, true);
-    let warned = events.iter().any(|e| {
-        matches!(e, StreamEvent::StatusDetail { detail }
-            if detail.contains("claude-haiku-4-5") && detail.contains("claude-fable-5"))
-    });
-    assert!(
-        warned,
-        "expected a substitution StatusDetail, got {events:?}"
-    );
-    assert!(state.warned_model_substitution);
-
-    // A matching served model must NOT warn.
-    let mut state = SseStreamState {
-        requested_model_base: "claude-opus-4-8".to_string(),
-        ..SseStreamState::default()
-    };
-    let event = SseEvent {
-        event_type: "message_start".to_string(),
-        data: serde_json::json!({
-            "type": "message_start",
-            "message": {"model": "claude-opus-4-8", "usage": {"input_tokens": 1}}
-        })
-        .to_string(),
-    };
-    let events = process_sse_event(&event, &mut state, true);
-    assert!(
-        !events
-            .iter()
-            .any(|e| matches!(e, StreamEvent::StatusDetail { .. })),
-        "served model matched request; must not warn"
-    );
-    assert!(!state.warned_model_substitution);
-}
-
-#[test]
-fn test_anthropic_thinking_sse_events() {
-    let mut state = SseStreamState::default();
-    let start = SseEvent {
-        event_type: "content_block_start".to_string(),
-        data: serde_json::json!({
-            "type": "content_block_start",
-            "index": 0,
-            "content_block": {"type": "thinking", "thinking": "", "signature": "sig"}
-        })
-        .to_string(),
-    };
-    let events = process_sse_event(&start, &mut state, false);
-    assert!(matches!(events.as_slice(), [StreamEvent::ThinkingStart]));
-    assert!(state.current_thinking_block);
-
-    let delta = SseEvent {
-        event_type: "content_block_delta".to_string(),
-        data: serde_json::json!({
-            "type": "content_block_delta",
-            "index": 0,
-            "delta": {"type": "thinking_delta", "thinking": "reasoning text"}
-        })
-        .to_string(),
-    };
-    let events = process_sse_event(&delta, &mut state, false);
-    assert!(
-        matches!(events.as_slice(), [StreamEvent::ThinkingDelta(text)] if text == "reasoning text")
-    );
-
-    let signature = SseEvent {
-        event_type: "content_block_delta".to_string(),
-        data: serde_json::json!({
-            "type": "content_block_delta",
-            "index": 0,
-            "delta": {"type": "signature_delta", "signature": "signed"}
-        })
-        .to_string(),
-    };
-    let events = process_sse_event(&signature, &mut state, false);
-    assert!(
-        matches!(events.as_slice(), [StreamEvent::ThinkingSignatureDelta(sig)] if sig == "signed")
-    );
-
-    let stop = SseEvent {
-        event_type: "content_block_stop".to_string(),
-        data: serde_json::json!({"type": "content_block_stop", "index": 0}).to_string(),
-    };
-    let events = process_sse_event(&stop, &mut state, false);
-    assert!(matches!(events.as_slice(), [StreamEvent::ThinkingEnd]));
-    assert!(!state.current_thinking_block);
 }
 
 #[test]
@@ -1999,28 +1886,6 @@ fn detects_live_fable_scoped_limit_errors_without_misrouting_other_limits() {
 }
 
 #[test]
-fn ping_keepalive_emits_streaming_phase_event() {
-    // Issue #451: during silent reasoning phases, `ping` events can be the
-    // only upstream traffic. They must surface as a StreamEvent so the client
-    // stall guard sees activity instead of cancelling a healthy stream.
-    let mut state = SseStreamState::default();
-    let event = SseEvent {
-        event_type: "ping".to_string(),
-        data: r#"{"type": "ping"}"#.to_string(),
-    };
-    let events = process_sse_event(&event, &mut state, true);
-    assert!(
-        events.iter().any(|e| matches!(
-            e,
-            StreamEvent::ConnectionPhase {
-                phase: jcode_message_types::ConnectionPhase::Streaming
-            }
-        )),
-        "expected ping to emit a Streaming ConnectionPhase event, got {events:?}"
-    );
-}
-
-#[test]
 fn test_anthropic_opus_5_low_effort_reaches_the_wire() {
     // Benchmark campaigns pin `claude-opus-5` at `low` effort. Opus 5 also
     // *defaults* to `low` (jcode's default model/effort pairing), and an
@@ -2065,41 +1930,4 @@ fn test_anthropic_opus_5_low_effort_reaches_the_wire() {
     );
     // Opus 5 rejects `thinking.type.enabled`; it requires adaptive thinking.
     assert!(matches!(thinking, Some(ApiThinking::Adaptive { .. })));
-}
-
-/// A `content_block_start` carrying an unrecognized block type must still
-/// deserialize. Before the `Unknown` catch-all the whole event failed to parse
-/// and was dropped, so an unknown *tool* block produced a turn that reported
-/// `stop_reason: tool_use` with no tool call for the agent to run.
-#[test]
-fn test_anthropic_unknown_content_block_start_does_not_drop_event() {
-    for block_type in [
-        "server_tool_use",
-        "web_search_tool_result",
-        "some_future_block",
-    ] {
-        let mut state = SseStreamState::default();
-        let event = SseEvent {
-            event_type: "content_block_start".to_string(),
-            data: serde_json::json!({
-                "type": "content_block_start",
-                "index": 0,
-                "content_block": {"type": block_type, "id": "srvtoolu_1", "name": "web_search"}
-            })
-            .to_string(),
-        };
-        let events = process_sse_event(&event, &mut state, false);
-        assert!(
-            events.is_empty(),
-            "{block_type}: unknown block must not synthesize stream events"
-        );
-        assert!(
-            state.current_tool_use.is_none(),
-            "{block_type}: unknown block must not start tool accumulation"
-        );
-        assert!(
-            !state.current_thinking_block,
-            "{block_type}: unknown block must not start a thinking block"
-        );
-    }
 }

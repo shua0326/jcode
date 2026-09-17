@@ -27,6 +27,9 @@ const API_URL: &str = "https://models.dev/api.json";
 const CACHE_FILE: &str = "models_dev_pricing.json";
 const CACHE_TTL_SECS: u64 = 24 * 60 * 60;
 const HTTP_TIMEOUT: Duration = Duration::from_secs(20);
+/// On-disk cache layout version. Bumped whenever the parsed fields change so an
+/// older cache is refreshed instead of silently serving missing capabilities.
+const CACHE_SCHEMA_VERSION: u32 = 2;
 
 /// Per-model USD prices per million tokens.
 #[derive(Debug, Clone, Copy, PartialEq, Serialize, Deserialize)]
@@ -41,10 +44,36 @@ pub struct ModelCost {
 
 #[derive(Debug, Clone, Default, Serialize, Deserialize)]
 struct PricingCache {
+    #[serde(default)]
+    schema_version: u32,
     cached_at_unix_secs: u64,
     /// provider id -> model id -> cost. Provider ids are models.dev ids
     /// (e.g. `anthropic`, `openai`, `deepseek`, `moonshotai`).
     providers: HashMap<String, HashMap<String, ModelCost>>,
+    /// provider id -> model id -> request-shape/effort metadata. Kept beside
+    /// pricing because both come from the same catalog fetch: gateways such as
+    /// OpenCode Go serve different models through different wire APIs, and
+    /// jcode must know which one before spending a model turn (issue: the free
+    /// `union-alpha` model 500s on `chat/completions` and only answers on the
+    /// Anthropic Messages shape).
+    #[serde(default)]
+    capabilities: HashMap<String, HashMap<String, ModelCapability>>,
+}
+
+/// Per-model request-shape and reasoning metadata published by models.dev.
+#[derive(Debug, Clone, Default, PartialEq, Serialize, Deserialize)]
+pub struct ModelCapability {
+    /// Wire API the gateway serves this model with, derived from the AI-SDK
+    /// package (`provider.npm`). `None` when the catalog does not say.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub wire_api: Option<String>,
+    /// Published reasoning effort ladder, normalized to jcode's vocabulary.
+    /// Empty when the catalog lists no explicit effort enum for the model.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub reasoning_efforts: Vec<String>,
+    /// Whether the catalog marks the model as reasoning-capable.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub reasoning: Option<bool>,
 }
 
 /// In-memory pricing cache keyed by the on-disk cache path it was loaded
@@ -103,8 +132,13 @@ pub fn models_dev_provider_id(jcode_provider: &str) -> Option<&'static str> {
     let key = jcode_provider
         .trim()
         .strip_prefix("openai-compatible:")
-        .unwrap_or_else(|| jcode_provider.trim());
-    Some(match key {
+        .unwrap_or_else(|| jcode_provider.trim())
+        .trim();
+    // Callers pass runtime keys (`opencode-go`), route api methods
+    // (`openai-compatible:opencode-go`), and display names (`OpenCode Go`).
+    // Normalizing here keeps every caller from re-implementing the mapping.
+    let key = key.to_ascii_lowercase().replace([' ', '_'], "-");
+    Some(match key.as_str() {
         "anthropic" | "claude" | "claude:api-key" | "anthropic-api" => "anthropic",
         "openai" | "openai:api-key" | "openai-api" => "openai",
         "openrouter" => "openrouter",
@@ -168,12 +202,66 @@ pub fn lookup(jcode_provider: &str, model: &str) -> Option<ModelCost> {
     None
 }
 
+/// Look up published request-shape/reasoning metadata for `model` under a jcode
+/// provider key. Returns `None` when the catalog has no entry for the model.
+///
+/// Callers use this to pick the wire API a gateway actually serves a model with
+/// (e.g. OpenCode Go answers `union-alpha` only on the Anthropic Messages
+/// shape) and to expose the effort ladder the provider documents.
+pub fn lookup_capability(jcode_provider: &str, model: &str) -> Option<ModelCapability> {
+    let provider_id = models_dev_provider_id(jcode_provider)?;
+    let cache = ensure_cache_fresh()?;
+    let models = cache.capabilities.get(provider_id)?;
+    let model = normalize_model_id(model);
+    if let Some(capability) = models.get(model) {
+        return Some(capability.clone());
+    }
+    // OpenRouter-style ids (`anthropic/claude-...`) may reach here with the
+    // provider prefix still attached; retry on the bare model name.
+    if let Some((_, bare)) = model.rsplit_once('/') {
+        return models.get(bare).cloned();
+    }
+    None
+}
+
+/// jcode's default thinking ladder for a Messages-wire reasoning model whose
+/// gateway publishes no explicit effort enum (e.g. OpenCode Go's `union-alpha`).
+/// The Messages API takes a token budget, so these names map to budgets in the
+/// request builder.
+const MESSAGES_DEFAULT_EFFORTS: [&str; 3] = ["low", "medium", "high"];
+
+/// Effort ladder to offer for a provider+model, in provider order.
+///
+/// 1. the ladder the catalog publishes for the model, when it has one;
+/// 2. for Messages-wire reasoning models, jcode's default budget ladder;
+/// 3. otherwise empty, so callers keep their own name-based heuristics.
+pub fn discovered_efforts(provider: &str, model: &str) -> Vec<&'static str> {
+    let Some(capability) = lookup_capability(provider, model) else {
+        return Vec::new();
+    };
+    if !capability.reasoning_efforts.is_empty() {
+        return capability
+            .reasoning_efforts
+            .iter()
+            .filter_map(|effort| jcode_provider_core::normalize_published_effort(effort))
+            .collect();
+    }
+    let messages_wire = capability.wire_api.as_deref() == Some("anthropic-messages");
+    if messages_wire && capability.reasoning != Some(false) {
+        return MESSAGES_DEFAULT_EFFORTS.to_vec();
+    }
+    Vec::new()
+}
+
 /// Return the freshest cache available, scheduling a refresh if needed.
 fn ensure_cache_fresh() -> Option<Arc<PricingCache>> {
     let cache = load_cache();
     let stale = cache
         .as_ref()
-        .map(|c| now_unix_secs().saturating_sub(c.cached_at_unix_secs) >= CACHE_TTL_SECS)
+        .map(|c| {
+            c.schema_version < CACHE_SCHEMA_VERSION
+                || now_unix_secs().saturating_sub(c.cached_at_unix_secs) >= CACHE_TTL_SECS
+        })
         .unwrap_or(true);
     if stale {
         schedule_refresh();
@@ -249,12 +337,25 @@ fn parse_api_response(body: &str) -> anyhow::Result<PricingCache> {
         .ok_or_else(|| anyhow::anyhow!("expected top-level provider object"))?;
 
     let mut providers: HashMap<String, HashMap<String, ModelCost>> = HashMap::new();
+    let mut capabilities: HashMap<String, HashMap<String, ModelCapability>> = HashMap::new();
     for (provider_id, provider) in top {
         let Some(models) = provider.get("models").and_then(|m| m.as_object()) else {
             continue;
         };
+        // The gateway-level AI-SDK package applies to every model unless a
+        // model overrides it (models.dev sets `provider.npm` per model for the
+        // models a gateway serves through a different API).
+        let provider_npm = provider
+            .get("npm")
+            .and_then(|v| v.as_str())
+            .unwrap_or_default();
         let mut parsed_models = HashMap::new();
+        let mut parsed_capabilities = HashMap::new();
         for (model_id, model) in models {
+            let capability = parse_model_capability(model, provider_npm);
+            if capability != ModelCapability::default() {
+                parsed_capabilities.insert(model_id.clone(), capability);
+            }
             let Some(cost) = model.get("cost") else {
                 continue;
             };
@@ -277,15 +378,65 @@ fn parse_api_response(body: &str) -> anyhow::Result<PricingCache> {
         if !parsed_models.is_empty() {
             providers.insert(provider_id.clone(), parsed_models);
         }
+        if !parsed_capabilities.is_empty() {
+            capabilities.insert(provider_id.clone(), parsed_capabilities);
+        }
     }
 
     if providers.is_empty() {
         anyhow::bail!("no priced models in models.dev response");
     }
     Ok(PricingCache {
+        schema_version: CACHE_SCHEMA_VERSION,
         cached_at_unix_secs: now_unix_secs(),
         providers,
+        capabilities,
     })
+}
+
+/// Read the request-shape/reasoning metadata models.dev publishes for one model.
+fn parse_model_capability(model: &serde_json::Value, provider_npm: &str) -> ModelCapability {
+    let npm = model
+        .get("provider")
+        .and_then(|provider| provider.get("npm"))
+        .and_then(|v| v.as_str())
+        .map(str::trim)
+        .filter(|npm| !npm.is_empty())
+        .unwrap_or(provider_npm);
+
+    let reasoning_efforts = model
+        .get("reasoning_options")
+        .and_then(|options| options.as_array())
+        .map(|options| {
+            let mut efforts = Vec::new();
+            for option in options {
+                if option.get("type").and_then(|v| v.as_str()) != Some("effort") {
+                    continue;
+                }
+                let Some(values) = option.get("values").and_then(|v| v.as_array()) else {
+                    continue;
+                };
+                for value in values {
+                    let Some(normalized) = value
+                        .as_str()
+                        .and_then(jcode_provider_core::normalize_published_effort)
+                    else {
+                        continue;
+                    };
+                    if !efforts.iter().any(|existing| existing == normalized) {
+                        efforts.push(normalized.to_string());
+                    }
+                }
+            }
+            efforts
+        })
+        .unwrap_or_default();
+
+    ModelCapability {
+        wire_api: jcode_provider_core::wire_api_for_npm(npm).map(|api| api.as_str().to_string()),
+        reasoning_efforts,
+        reasoning: model.get("reasoning").and_then(|v| v.as_bool()),
+    }
 }
 
 #[cfg(test)]
@@ -298,9 +449,27 @@ pub(crate) fn save_test_cache(entries: &[(&str, &str, ModelCost)]) {
             .insert((*model).to_string(), *cost);
     }
     save_cache(&PricingCache {
+        schema_version: CACHE_SCHEMA_VERSION,
         cached_at_unix_secs: now_unix_secs(),
         providers,
+        capabilities: HashMap::new(),
     });
+}
+
+/// Test helper: persist capability metadata the way a real catalog fetch would.
+#[cfg(test)]
+pub(crate) fn save_test_capability(provider: &str, model: &str, capability: ModelCapability) {
+    let mut cache = load_cache()
+        .map(|cache| (*cache).clone())
+        .unwrap_or_default();
+    cache.schema_version = CACHE_SCHEMA_VERSION;
+    cache.cached_at_unix_secs = now_unix_secs();
+    cache
+        .capabilities
+        .entry(provider.to_string())
+        .or_default()
+        .insert(model.to_string(), capability);
+    save_cache(&cache);
 }
 
 #[cfg(test)]
@@ -357,6 +526,100 @@ mod tests {
     fn rejects_empty_response() {
         assert!(parse_api_response("{}").is_err());
         assert!(parse_api_response("[]").is_err());
+    }
+
+    #[test]
+    fn parses_gateway_wire_api_and_effort_metadata() {
+        // Trimmed models.dev shape: the opencode-go gateway serves models
+        // through different AI-SDK packages, which is what decides the wire API.
+        let body = r#"{
+            "opencode-go": {
+                "npm": "@ai-sdk/openai-compatible",
+                "models": {
+                    "deepseek-v4.1-flash": {
+                        "reasoning": true,
+                        "reasoning_options": [{"type": "effort", "values": ["low", "high", "max"]}],
+                        "cost": {"input": 0.15, "output": 0.6}
+                    },
+                    "union-alpha": {
+                        "reasoning": true,
+                        "reasoning_options": [],
+                        "provider": {"npm": "@ai-sdk/anthropic"},
+                        "cost": {"input": 0, "output": 0}
+                    },
+                    "muse-spark-1.3-contributor": {
+                        "provider": {"npm": "@ai-sdk/openai"},
+                        "reasoning": true,
+                        "reasoning_options": [
+                            {"type": "effort", "values": ["minimal", "high", "xhigh"]},
+                            {"type": "toggle"}
+                        ],
+                        "cost": {"input": 0.1, "output": 0.2}
+                    },
+                    "gpt-5.6-luna": {
+                        "reasoning_options": [
+                            {"type": "effort", "values": ["low", "turbo", "xhigh"]}
+                        ],
+                        "cost": {"input": 0.2, "output": 0.8}
+                    }
+                }
+            }
+        }"#;
+        let cache = parse_api_response(body).expect("parsed");
+        let capabilities = cache.capabilities.get("opencode-go").expect("capabilities");
+
+        let union = capabilities.get("union-alpha").expect("union-alpha");
+        assert_eq!(union.wire_api.as_deref(), Some("anthropic-messages"));
+        assert!(union.reasoning_efforts.is_empty());
+        assert_eq!(union.reasoning, Some(true));
+
+        let muse = capabilities
+            .get("muse-spark-1.3-contributor")
+            .expect("muse");
+        assert_eq!(muse.wire_api.as_deref(), Some("openai-responses"));
+        assert_eq!(muse.reasoning_efforts, vec!["minimal", "high", "xhigh"]);
+
+        let deepseek = capabilities.get("deepseek-v4.1-flash").expect("deepseek");
+        assert_eq!(deepseek.wire_api.as_deref(), Some("openai-chat"));
+        assert_eq!(deepseek.reasoning_efforts, vec!["low", "high", "max"]);
+
+        // Unknown published values are dropped rather than offered in the picker.
+        let luna = capabilities.get("gpt-5.6-luna").expect("luna");
+        assert_eq!(luna.wire_api.as_deref(), Some("openai-chat"));
+        assert_eq!(luna.reasoning_efforts, vec!["low", "xhigh"]);
+    }
+
+    #[test]
+    fn capability_lookup_reads_the_saved_catalog() {
+        let _guard = crate::storage::lock_test_env();
+        let temp = tempfile::tempdir().expect("tempdir");
+        let prev_home = std::env::var_os("JCODE_HOME");
+        crate::env::set_var("JCODE_HOME", temp.path());
+        clear_memory_cache_for_tests();
+
+        save_test_capability(
+            "opencode-go",
+            "union-alpha",
+            ModelCapability {
+                wire_api: Some("anthropic-messages".to_string()),
+                reasoning_efforts: Vec::new(),
+                reasoning: Some(true),
+            },
+        );
+
+        let capability =
+            lookup_capability("openai-compatible:opencode-go", "union-alpha").expect("capability");
+        assert_eq!(capability.wire_api.as_deref(), Some("anthropic-messages"));
+        // Provider-prefixed ids fall back to the bare model name.
+        assert!(lookup_capability("opencode-go", "opencode-go/union-alpha").is_some());
+        assert!(lookup_capability("opencode-go", "not-a-model").is_none());
+
+        clear_memory_cache_for_tests();
+        if let Some(prev) = prev_home {
+            crate::env::set_var("JCODE_HOME", prev);
+        } else {
+            crate::env::remove_var("JCODE_HOME");
+        }
     }
 
     #[test]

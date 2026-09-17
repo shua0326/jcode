@@ -171,6 +171,47 @@ impl Provider for OpenRouterProvider {
                 }
                 (request, input, system_value, api_tools)
             }
+            OpenAiCompatibleWireApi::Messages => {
+                let api_messages: Vec<Value> =
+                    jcode_provider_anthropic::format_messages(&effective_messages, false)
+                        .iter()
+                        .filter_map(|message| serde_json::to_value(message).ok())
+                        .collect();
+                let api_tools: Vec<Value> =
+                    jcode_provider_anthropic::format_tools(tools, false, false)
+                        .iter()
+                        .filter_map(|tool| serde_json::to_value(tool).ok())
+                        .collect();
+                let system_value = jcode_provider_anthropic::build_system_param(
+                    system, false, false,
+                )
+                .map(|system| serde_json::to_value(system).unwrap_or(serde_json::Value::Null));
+                let mut request = serde_json::json!({
+                    "model": model,
+                    // The Messages API requires max_tokens. Gateways that serve
+                    // this shape publish no separate cap, so fall back to the
+                    // Anthropic runtime's default.
+                    "max_tokens": self.max_tokens.unwrap_or(MESSAGES_DEFAULT_MAX_TOKENS),
+                    "messages": serde_json::json!(&api_messages),
+                    "stream": true,
+                });
+                if let Some(system_value) = system_value.as_ref() {
+                    request["system"] = system_value.clone();
+                }
+                if !api_tools.is_empty() {
+                    request["tools"] = serde_json::json!(&api_tools);
+                }
+                if let Some(budget) = reasoning_effort
+                    .as_deref()
+                    .and_then(messages_thinking_budget_for_effort)
+                {
+                    request["thinking"] = serde_json::json!({
+                        "type": "enabled",
+                        "budget_tokens": budget,
+                    });
+                }
+                (request, api_messages, system_value, api_tools)
+            }
         };
 
         let mut sent_reasoning_config = false;
@@ -547,20 +588,7 @@ impl Provider for OpenRouterProvider {
     }
 
     fn available_efforts(&self) -> Vec<&'static str> {
-        if self.supports_muse_spark_reasoning_effort() {
-            jcode_provider_core::MUSE_SPARK_SELECTABLE_EFFORTS.to_vec()
-        } else if self.supports_deepseek_reasoning_effort() {
-            jcode_provider_core::DEEPSEEK_SELECTABLE_EFFORTS.to_vec()
-        } else if self.supports_openai_reasoning_effort() {
-            jcode_provider_core::OPENAI_SELECTABLE_EFFORTS.to_vec()
-        } else if Self::profile_supports_unified_reasoning(
-            self.profile_id.as_deref(),
-            self.send_openrouter_headers,
-        ) {
-            jcode_provider_core::OPENROUTER_SELECTABLE_EFFORTS.to_vec()
-        } else {
-            vec![]
-        }
+        self.model_effort_ladder()
     }
 
     fn available_models(&self) -> Vec<&'static str> {
