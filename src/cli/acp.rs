@@ -2564,13 +2564,29 @@ impl EventMapper {
                     if let Some(secs) = member.runtime.elapsed_secs.filter(|secs| *secs >= 15) {
                         title.push_str(&format!(" · {}s", secs / 15 * 15));
                     }
-                    let detail = member
+                    let task = member
                         .task_label
                         .as_deref()
-                        .or(member.detail.as_deref())
                         .map(compact_swarm_label)
-                        .unwrap_or_default();
-                    let snapshot = title.clone();
+                        .filter(|value| !value.is_empty());
+                    let detail = member
+                        .detail
+                        .as_deref()
+                        .map(compact_swarm_label)
+                        .filter(|value| !value.is_empty())
+                        .unwrap_or_else(|| member.status.clone());
+                    let raw_input = json!({
+                        "agent": name,
+                        "task": task,
+                        "model": member.runtime.model.as_deref(),
+                    });
+                    let raw_output = json!({
+                        "status": member.status,
+                        "detail": detail.clone(),
+                        "todoProgress": member.todo_progress.map(|(done, total)| json!({"done": done, "total": total})),
+                        "elapsedSeconds": member.runtime.elapsed_secs,
+                    });
+                    let snapshot = format!("{title}\n{raw_input}\n{raw_output}");
                     if self.swarm_status.get(&id) == Some(&snapshot) {
                         continue;
                     }
@@ -2585,6 +2601,7 @@ impl EventMapper {
                         "sessionUpdate": if first { "tool_call" } else { "tool_call_update" },
                         "toolCallId": id, "title": title,
                         "kind": "other", "status": status,
+                        "rawInput": raw_input, "rawOutput": raw_output,
                         "content": [{"type":"content", "content":{"type":"text", "text":detail}}],
                     }));
                 }
@@ -3774,6 +3791,7 @@ mod tests {
         let mut mapper = EventMapper::new("parent".into(), AcpProfile::Standard);
         let member: crate::protocol::SwarmMemberStatus = serde_json::from_value(json!({
             "session_id": "child", "status": "running", "friendly_name": "Researcher",
+            "task_label": "Investigate the failing UI test", "detail": "Reading AX evidence",
             "todo_progress": [1, 3], "report_back_to_session_id": "parent",
             "runtime": {"model":"deepseek-v4.1-flash", "elapsed_secs":31}
         }))
@@ -3784,6 +3802,8 @@ mod tests {
         assert_eq!(event[0]["sessionUpdate"], "tool_call");
         assert_eq!(event[0]["status"], "in_progress");
         assert_eq!(event[0]["title"], "🐝 Researcher · running · 1/3 tasks · 30s");
+        assert_eq!(event[0]["rawInput"]["task"], "Investigate the failing UI test");
+        assert_eq!(event[0]["rawOutput"]["detail"], "Reading AX evidence");
         assert!(
             mapper
                 .map_event(ServerEvent::SwarmStatus {
@@ -3791,7 +3811,17 @@ mod tests {
                 })
                 .is_empty()
         );
-        let mut advanced = member.clone();
+        let mut reporting = member.clone();
+        reporting.detail = Some("Classifying the five failures".into());
+        let detail_update = mapper.map_event(ServerEvent::SwarmStatus {
+            members: vec![reporting.clone()],
+        });
+        assert_eq!(detail_update[0]["sessionUpdate"], "tool_call_update");
+        assert_eq!(
+            detail_update[0]["rawOutput"]["detail"],
+            "Classifying the five failures"
+        );
+        let mut advanced = reporting;
         advanced.todo_progress = Some((2, 3));
         advanced.runtime.elapsed_secs = Some(46);
         let update = mapper.map_event(ServerEvent::SwarmStatus {
