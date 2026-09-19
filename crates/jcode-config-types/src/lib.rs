@@ -381,6 +381,16 @@ pub struct CompactionConfig {
 
     /// [semantic] Number of recent turns to look at for building the "current goal" embedding
     pub goal_window_turns: usize,
+
+    /// Hard cap on the token budget compaction measures against, regardless of
+    /// the model's advertised context window. 0 = no cap (use the model window).
+    ///
+    /// Every turn re-sends the whole transcript, so on a 1M-window model the
+    /// default 80%-of-window trigger lets a session reach ~800k tokens per
+    /// request before anything folds. Set this to e.g. 200000 to compact earlier
+    /// on large-window providers. This bounds the compaction trigger budget,
+    /// not the final request size when recent messages cannot be compacted.
+    pub max_context_tokens: usize,
 }
 
 impl Default for CompactionConfig {
@@ -396,6 +406,7 @@ impl Default for CompactionConfig {
             topic_shift_threshold: 0.45,
             relevance_keep_threshold: 0.65,
             goal_window_turns: 5,
+            max_context_tokens: 0,
         }
     }
 }
@@ -554,6 +565,11 @@ pub struct AgentsConfig {
     /// call does not pass an explicit `effort`. Leave unset to let workers
     /// inherit the provider-wide reasoning effort.
     pub swarm_effort: Option<String>,
+    /// Root reasoning effort in light swarm mode. Unset or invalid means `max`.
+    /// This does not change worker effort (`swarm_effort`).
+    pub swarm_root_effort: Option<String>,
+    /// Root reasoning effort in deep swarm mode. Unset or invalid means `max`.
+    pub swarm_deep_root_effort: Option<String>,
     /// Default terminal mode for swarm-created agents.
     pub swarm_spawn_mode: SwarmSpawnMode,
     /// Maximum percentage (1-90) of the chat column height the inline swarm
@@ -656,6 +672,8 @@ impl Default for AgentsConfig {
         Self {
             swarm_model: None,
             swarm_effort: None,
+            swarm_root_effort: None,
+            swarm_deep_root_effort: None,
             swarm_spawn_mode: SwarmSpawnMode::default(),
             swarm_gallery_max_pct: None,
             swarm_strip_layout: SwarmStripLayout::default(),
@@ -670,6 +688,24 @@ impl Default for AgentsConfig {
             memory_embedding_dim: None,
             swarm_max_concurrent_agents: default_swarm_max_concurrent_agents(),
         }
+    }
+}
+
+impl AgentsConfig {
+    /// Resolve a swarm mode's root effort without allowing orchestration
+    /// sentinels to recurse into another mode. Unknown values preserve the
+    /// historical maximum-effort behavior without invalidating other settings.
+    pub fn root_effort_for_swarm(&self, deep: bool) -> &'static str {
+        let configured = if deep {
+            self.swarm_deep_root_effort.as_deref()
+        } else {
+            self.swarm_root_effort.as_deref()
+        };
+        let value = configured.unwrap_or("max").trim();
+        ["none", "minimal", "low", "medium", "high", "xhigh", "max"]
+            .into_iter()
+            .find(|level| level.eq_ignore_ascii_case(value))
+            .unwrap_or("max")
     }
 }
 
@@ -1244,6 +1280,16 @@ pub struct ProviderConfig {
     /// Copilot premium request mode: "normal", "one", or "zero"
     /// "zero" means all requests are free (no premium requests consumed)
     pub copilot_premium: Option<String>,
+    /// Pin the `gemini` provider to Code Assist OAuth even when a Gemini
+    /// Developer API key (`gemini.env` / `GEMINI_API_KEY`) is present. Without
+    /// this an API key silently wins and every turn bills per token on the
+    /// key's project. `JCODE_GEMINI_FORCE_OAUTH` overrides this value.
+    pub gemini_force_oauth: bool,
+    /// Google Cloud project for Gemini Code Assist OAuth. Workspace accounts
+    /// require one; without it every turn fails with "requires setting
+    /// GOOGLE_CLOUD_PROJECT". `GOOGLE_CLOUD_PROJECT` (or its legacy `_ID`
+    /// alias) overrides this value. Config values are never exported to env.
+    pub gemini_project: Option<String>,
     /// When set (non-empty), /model only lists routes from these providers.
     /// Entries match provider labels ("openai", "anthropic", "copilot",
     /// "openrouter", ...), api methods ("claude-oauth",
@@ -1278,6 +1324,8 @@ impl Default for ProviderConfig {
             cross_provider_failover: CrossProviderFailoverMode::Countdown,
             same_provider_account_failover: true,
             copilot_premium: None,
+            gemini_force_oauth: false,
+            gemini_project: None,
             model_picker_providers: None,
             stream_idle_timeout_secs: 180,
             max_retries: 8,

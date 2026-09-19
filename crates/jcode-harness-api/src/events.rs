@@ -89,6 +89,14 @@ pub enum ApiEvent {
         images: Vec<RenderedImage>,
     },
 
+    /// Complete session-scoped Markdown side-panel state. Replace the previous
+    /// snapshot, including when pages is empty. Sent live and during attachment
+    /// hydration, possibly before `Attached`. Subscribe before attaching.
+    SidePanelState {
+        session_id: String,
+        snapshot: crate::SidePanelSnapshot,
+    },
+
     /// Usage for the latest provider call, not cumulative session or turn totals.
     /// Input/cache accounting is provider-specific: Anthropic reports cache
     /// reads and writes separately, while OpenAI includes cache reads in input.
@@ -293,6 +301,9 @@ pub enum ErrorCode {
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
 pub struct SessionInfo {
+    /// Cumulative built-in file-tool changes. Absent when unavailable.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub edit_stats: Option<crate::SessionEditStats>,
     pub session_id: String,
     /// Swarm owner this agent reports to, not the transcript's fork parent.
     /// Absent for ordinary sessions and user-created forks.

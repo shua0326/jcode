@@ -1016,64 +1016,44 @@ pub struct OpenRouterProvider {
 }
 
 impl OpenRouterProvider {
-    fn is_opencode_go_profile(&self) -> bool {
-        if self
-            .profile_id
-            .as_deref()
-            .is_some_and(|id| id.eq_ignore_ascii_case("opencode-go"))
-        {
-            return true;
-        }
-
-        let Ok(url) = reqwest::Url::parse(&self.api_base) else {
+    /// Apply a real (already resolved) effort without changing the stored swarm mode.
+    fn apply_resolved_reasoning_effort(
+        &self,
+        request: &mut Value,
+        effort: &str,
+        strict_openai_schema: bool,
+    ) -> bool {
+        if self.supports_deepseek_reasoning_effort() {
+            let effort = match effort {
+                "minimal" => "low",
+                "xhigh" => "high",
+                other => other,
+            };
+            if effort == "none" {
+                return false;
+            }
+            request["reasoning_effort"] = serde_json::json!(effort);
+        } else if self.supports_openai_reasoning_effort() {
+            // Strict endpoints such as Mistral reject the UX alias `max`.
+            let effort = if strict_openai_schema && effort == "max" {
+                "xhigh"
+            } else {
+                effort
+            };
+            if effort == "none" {
+                return false;
+            }
+            request["reasoning_effort"] = serde_json::json!(effort);
+        } else if Self::profile_supports_unified_reasoning(
+            self.profile_id.as_deref(),
+            self.send_openrouter_headers,
+        ) {
+            let effort = if effort == "max" { "xhigh" } else { effort };
+            request["reasoning"] = serde_json::json!({"effort": effort});
+        } else {
             return false;
-        };
-        matches!(url.host_str(), Some("opencode.ai"))
-            && url.path().trim_end_matches('/').ends_with("/zen/go/v1")
-    }
-
-    fn model_is_muse_spark_family(model: &str) -> bool {
-        model.trim().to_ascii_lowercase().starts_with("muse-spark-")
-    }
-
-    fn wire_api_for_model(&self, model: &str) -> OpenAiCompatibleWireApi {
-        // Published gateway metadata wins: models.dev states which AI-SDK
-        // package each model is served with, and aggregator gateways mix them
-        // inside one profile. Name heuristics below are the fallback for
-        // catalogs that do not publish the package.
-        //
-        // Follow-up (not implemented): when no metadata is published and the
-        // chosen shape fails with an opaque error, retry the other shapes once
-        // and remember the one that worked. That would cover gateways whose
-        // catalog entry is missing or wrong, at the cost of one wasted request
-        // per new model.
-        if let Some(api) = self.published_wire_api(model) {
-            return api;
         }
-        if self.is_opencode_go_profile() && Self::model_is_muse_spark_family(model) {
-            return OpenAiCompatibleWireApi::Responses;
-        }
-        OpenAiCompatibleWireApi::ChatCompletions
-    }
-
-    /// Wire API for `model` from the models.dev catalog, when published.
-    fn published_wire_api(&self, model: &str) -> Option<OpenAiCompatibleWireApi> {
-        let capability =
-            jcode_base::model_pricing::lookup_capability(self.catalog_provider_key(), model)?;
-        OpenAiCompatibleWireApi::from_published(capability.wire_api.as_deref())
-    }
-
-    /// models.dev provider id for this runtime: the profile id when it is a
-    /// direct compatible profile, else the shared `openrouter` entry.
-    fn catalog_provider_key(&self) -> &str {
-        self.profile_id.as_deref().unwrap_or("openrouter")
-    }
-
-    fn supports_muse_spark_reasoning_effort(&self) -> bool {
-        self.is_opencode_go_profile()
-            && Self::model_is_muse_spark_family(&self.model_snapshot())
-            && self.model_reasoning_support() != Some(false)
-            && self.reasoning_effort_support != Some(false)
+        true
     }
 
     fn profile_supports_reasoning_effort(profile_id: Option<&str>) -> bool {

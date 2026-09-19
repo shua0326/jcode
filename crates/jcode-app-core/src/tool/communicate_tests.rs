@@ -1519,6 +1519,7 @@ impl RawClient {
         let id = self.next_id;
         self.next_id += 1;
         self.send_request(Request::Subscribe {
+            supports_pdf_panels: false,
             id,
             working_dir: Some(working_dir.display().to_string()),
             selfdev: None,

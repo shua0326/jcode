@@ -805,9 +805,16 @@ impl Agent {
                         });
                     }
                     StreamEvent::SessionId(sid) => {
+                        // This is the *provider's* session id (Gemini/Claude
+                        // CLI/Grok resume handle). It must never be forwarded
+                        // as `ServerEvent::SessionId`: the client treats that
+                        // event as the jcode session id and rebinds
+                        // `remote_session_id` to it, so the next reload or
+                        // reconnect resumes a session that does not exist and
+                        // the user lands in an empty new session while the
+                        // real transcript sits untouched on disk.
                         self.provider_session_id = Some(sid.clone());
-                        self.session.provider_session_id = Some(sid.clone());
-                        let _ = event_tx.send(ServerEvent::SessionId { session_id: sid });
+                        self.session.provider_session_id = Some(sid);
                     }
                     StreamEvent::OpenAIReasoning {
                         id,
@@ -1090,17 +1097,7 @@ impl Agent {
                 content_blocks.extend(openai_reasoning_items.iter().cloned());
             }
             for tc in &tool_calls {
-                content_blocks.push(ContentBlock::ToolUse {
-                    id: tc.id.clone(),
-                    name: tc.name.clone(),
-                    input: tc.input.clone(),
-                    // Gemini 3 signs its function calls and the Cloud Code backend
-                    // rejects a replay of unsigned ones ("Function call is missing
-                    // a thought_signature"), so persist what the stream captured.
-                    // Dropping it here broke every multi-turn Antigravity tool
-                    // loop on the daemon/ACP path.
-                    thought_signature: tc.thought_signature.clone(),
-                });
+                content_blocks.push(tc.to_tool_use_block());
             }
 
             let assistant_message_id = if !content_blocks.is_empty() {
