@@ -33,7 +33,6 @@ pub(super) async fn run_stream_with_retries(
     auth: ProviderAuth,
     send_openrouter_headers: bool,
     conversation_id: String,
-    wire_api: OpenAiCompatibleWireApi,
     request: Value,
     tx: mpsc::Sender<Result<StreamEvent>>,
     provider_pin: Arc<Mutex<Option<ProviderPin>>>,
@@ -95,7 +94,6 @@ pub(super) async fn run_stream_with_retries(
             auth.clone(),
             send_openrouter_headers,
             &conversation_id,
-            wire_api,
             request.clone(),
             attempt_tx,
             Arc::clone(&provider_pin),
@@ -165,7 +163,6 @@ async fn stream_response(
     auth: ProviderAuth,
     send_openrouter_headers: bool,
     conversation_id: &str,
-    wire_api: OpenAiCompatibleWireApi,
     request: Value,
     tx: mpsc::Sender<Result<StreamEvent>>,
     provider_pin: Arc<Mutex<Option<ProviderPin>>>,
@@ -180,29 +177,18 @@ async fn stream_response(
     let connect_start = std::time::Instant::now();
     let stream_idle_timeout = jcode_base::provider::stream_idle_timeout();
 
-    let url = format!("{}/{}", api_base, wire_api.path());
-    let mut req = client
-        .post(&url)
-        .header("Content-Type", "application/json")
-        .header("Accept-Encoding", "identity");
-    // The Messages wire authenticates with `x-api-key` + `anthropic-version`,
-    // not the profile's bearer token (the same key fails as a bearer there).
-    req = match wire_api {
-        OpenAiCompatibleWireApi::Messages => {
-            if matches!(auth, ProviderAuth::AzureEntra { .. }) {
-                anyhow::bail!(
-                    "Azure OpenAI does not serve the Anthropic Messages API, which this model's catalog entry requires"
-                );
-            }
-            let mut req = req.header("anthropic-version", ANTHROPIC_VERSION);
-            if let Some((name, value)) = auth.messages_auth_header() {
-                req = req.header(name, value);
-            }
-            req
-        }
-        _ => auth.apply(req).await?,
-    };
-    let mut req = apply_kimi_coding_agent_headers(req, &api_base, Some(&model));
+    let url = format!("{}/chat/completions", api_base);
+    let mut req = apply_kimi_coding_agent_headers(
+        auth.apply(
+            client
+                .post(&url)
+                .header("Content-Type", "application/json")
+                .header("Accept-Encoding", "identity"),
+        )
+        .await?,
+        &api_base,
+        Some(&model),
+    );
 
     if send_openrouter_headers {
         req = req
@@ -219,8 +205,7 @@ async fn stream_response(
     .with_context(|| {
         let hint = local_endpoint_troubleshooting_hint(&api_base, &model);
         format!(
-            "Failed to send OpenAI-compatible {} request\n  endpoint: {}\n  model: {}\n  auth: {}\n{}",
-            wire_api.log_name(),
+            "Failed to send OpenAI-compatible chat request\n  endpoint: {}\n  model: {}\n  auth: {}\n{}",
             url,
             model,
             auth.label(),
@@ -242,8 +227,7 @@ async fn stream_response(
         let hint = local_endpoint_troubleshooting_hint(&api_base, &model);
         return Err(jcode_provider_core::retry_after::error_with_retry_after(
             format!(
-                "OpenAI-compatible {} request failed\n  endpoint: {}\n  model: {}\n  auth: {}\n  status: {}\n  response: {}\n{}",
-                wire_api.log_name(),
+                "OpenAI-compatible chat request failed\n  endpoint: {}\n  model: {}\n  auth: {}\n  status: {}\n  response: {}\n{}",
                 url,
                 model,
                 auth.label(),
@@ -261,20 +245,7 @@ async fn stream_response(
         }))
         .await;
 
-    let byte_stream = response.bytes_stream();
-    let mut stream: EventStream = match wire_api {
-        OpenAiCompatibleWireApi::ChatCompletions => Box::pin(OpenRouterStream::new(
-            byte_stream,
-            model.clone(),
-            provider_pin,
-        )),
-        OpenAiCompatibleWireApi::Responses => Box::pin(
-            jcode_provider_openai::stream::OpenAIResponsesStream::new(byte_stream),
-        ),
-        OpenAiCompatibleWireApi::Messages => {
-            Box::pin(MessagesWireStream::new(byte_stream, model.clone()))
-        }
-    };
+    let mut stream = OpenRouterStream::new(response.bytes_stream(), model.clone(), provider_pin);
 
     // Idle timeout between streamed chunks. Configurable so slow reasoning
     // models (e.g. DeepSeek) that think silently for minutes before emitting
@@ -287,8 +258,7 @@ async fn stream_response(
         let event = match tokio::time::timeout(stream_idle_timeout, stream.next()).await {
             Ok(Some(Ok(event))) => event,
             Ok(Some(Err(e))) => anyhow::bail!(
-                "OpenAI-compatible {} stream error\n  endpoint: {}\n  model: {}\n  auth: {}\n  error: {}",
-                wire_api.log_name(),
+                "OpenAI-compatible stream error\n  endpoint: {}\n  model: {}\n  auth: {}\n  error: {}",
                 url,
                 model,
                 auth.label(),
@@ -301,8 +271,7 @@ async fn stream_response(
                     idle_timeout_secs
                 ));
                 anyhow::bail!(
-                    "OpenAI-compatible {} stream timeout\n  endpoint: {}\n  model: {}\n  auth: {}\n  timeout: no data received for {} seconds\n{}",
-                    wire_api.log_name(),
+                    "OpenAI-compatible stream timeout\n  endpoint: {}\n  model: {}\n  auth: {}\n  timeout: no data received for {} seconds\n{}",
                     url,
                     model,
                     auth.label(),
@@ -317,83 +286,6 @@ async fn stream_response(
     }
 
     Ok(())
-}
-
-/// Streams an Anthropic Messages response body as jcode stream events.
-///
-/// Gateways that serve a model through the Messages API answer with the
-/// Anthropic SSE vocabulary, which the shared translator in
-/// `jcode-provider-anthropic` decodes exactly like the direct Anthropic path.
-struct MessagesWireStream {
-    inner: std::pin::Pin<Box<dyn futures::Stream<Item = reqwest::Result<bytes::Bytes>> + Send>>,
-    translator: jcode_provider_anthropic::messages_stream::MessagesSseTranslator,
-    pending: std::collections::VecDeque<StreamEvent>,
-    usage_sent: bool,
-    done: bool,
-}
-
-impl MessagesWireStream {
-    fn new(
-        byte_stream: impl futures::Stream<Item = reqwest::Result<bytes::Bytes>> + Send + 'static,
-        model: String,
-    ) -> Self {
-        Self {
-            inner: Box::pin(byte_stream),
-            translator: jcode_provider_anthropic::messages_stream::MessagesSseTranslator::new(
-                jcode_provider_anthropic::messages_stream::MessagesStreamOptions {
-                    requested_model: model,
-                    provider_label: "Messages gateway".to_string(),
-                    oauth_tool_name_mapping: false,
-                },
-            ),
-            pending: std::collections::VecDeque::new(),
-            usage_sent: false,
-            done: false,
-        }
-    }
-}
-
-impl futures::Stream for MessagesWireStream {
-    type Item = Result<StreamEvent>;
-
-    fn poll_next(
-        mut self: std::pin::Pin<&mut Self>,
-        cx: &mut std::task::Context<'_>,
-    ) -> std::task::Poll<Option<Self::Item>> {
-        use std::task::Poll;
-        loop {
-            if let Some(event) = self.pending.pop_front() {
-                return Poll::Ready(Some(Ok(event)));
-            }
-            if self.done {
-                // Report usage once the stream ends, mirroring the direct
-                // Anthropic runtime so cache/token accounting stays intact.
-                let usage = self.translator.usage();
-                if !self.usage_sent && usage.has_any() {
-                    self.usage_sent = true;
-                    return Poll::Ready(Some(Ok(StreamEvent::TokenUsage {
-                        input_tokens: usage.input_tokens,
-                        output_tokens: usage.output_tokens,
-                        cache_read_input_tokens: usage.cache_read_input_tokens,
-                        cache_creation_input_tokens: usage.cache_creation_input_tokens,
-                    })));
-                }
-                return Poll::Ready(None);
-            }
-            match self.inner.as_mut().poll_next(cx) {
-                Poll::Ready(Some(Ok(chunk))) => {
-                    let events = self.translator.push_chunk(&chunk);
-                    self.pending.extend(events);
-                }
-                Poll::Ready(Some(Err(error))) => {
-                    self.done = true;
-                    return Poll::Ready(Some(Err(anyhow::Error::new(error))));
-                }
-                Poll::Ready(None) => self.done = true,
-                Poll::Pending => return Poll::Pending,
-            }
-        }
-    }
 }
 
 /// Extract the HTTP status code reported in a formatted provider error string.

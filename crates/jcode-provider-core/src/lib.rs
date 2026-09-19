@@ -16,6 +16,7 @@ pub mod transport;
 pub mod wire_api;
 
 pub use jcode_usage_types::{ModelUsage, compare_model_usage};
+pub use wire_api::{WireApi, normalize_published_effort, wire_api_for_npm};
 pub use transport::is_transient_transport_error;
 
 pub use anthropic::{
