@@ -1025,6 +1025,41 @@ impl AcpRuntime {
                                 .await;
                         });
                     }
+                    ServerEvent::SwarmStatus { members } => {
+                        let progress = (!active.prompt_running.load(Ordering::SeqCst))
+                            .then(|| active_swarm_progress(&active.session_id, &members))
+                            .flatten();
+                        let updates = mapper.map_event(ServerEvent::SwarmStatus { members });
+                        if updates.is_empty() {
+                            continue;
+                        }
+                        // Zed currently does not reliably repaint content inside
+                        // an in-progress ACP tool card. Keep the structured cards,
+                        // but add a compact text fallback while the parent is idle.
+                        if let Some(progress) = progress
+                            && runtime
+                                .write_notification(
+                                    "session/update",
+                                    json!({"sessionId":active.session_id,"update":agent_message_chunk(progress)}),
+                                )
+                                .await
+                                .is_err()
+                        {
+                            return;
+                        }
+                        for update in updates {
+                            if runtime
+                                .write_notification(
+                                    "session/update",
+                                    json!({"sessionId":active.session_id,"update":update}),
+                                )
+                                .await
+                                .is_err()
+                            {
+                                return;
+                            }
+                        }
+                    }
                     ServerEvent::TextDelta { .. }
                     | ServerEvent::TextReplace { .. }
                     | ServerEvent::ReasoningDelta { .. }
@@ -1035,7 +1070,6 @@ impl AcpRuntime {
                     | ServerEvent::ToolExec { .. }
                     | ServerEvent::ToolOutput { .. }
                     | ServerEvent::ToolDone { .. }
-                    | ServerEvent::SwarmStatus { .. }
                     | ServerEvent::SwarmPlan { .. } => {
                         for update in mapper.map_event(event) {
                             if runtime
@@ -1982,6 +2016,53 @@ fn compact_swarm_label(text: &str) -> String {
         label.push('…');
     }
     label
+}
+
+fn active_swarm_progress(
+    session_id: &str,
+    members: &[crate::protocol::SwarmMemberStatus],
+) -> Option<String> {
+    let active: Vec<_> = members
+        .iter()
+        .filter(|member| {
+            member.report_back_to_session_id.as_deref() == Some(session_id)
+                && matches!(
+                    member.status.as_str(),
+                    "queued" | "running" | "working" | "busy" | "thinking" | "streaming"
+                )
+        })
+        .collect();
+    if active.is_empty() {
+        return None;
+    }
+
+    let mut items: Vec<String> = active
+        .iter()
+        .take(3)
+        .map(|member| {
+            let name = member
+                .friendly_name
+                .as_deref()
+                .unwrap_or(&member.session_id);
+            let mut item = format!("{name}: {}", member.status);
+            if let Some((done, total)) = member.todo_progress {
+                item.push_str(&format!(" ({done}/{total} tasks)"));
+            } else if let Some(detail) = member.detail.as_deref() {
+                let detail = compact_swarm_label(detail);
+                if !detail.is_empty() {
+                    item.push_str(&format!(" ({detail})"));
+                }
+            }
+            item
+        })
+        .collect();
+    if active.len() > items.len() {
+        items.push(format!("+{} more", active.len() - items.len()));
+    }
+    Some(format!(
+        "\n🐝 **Subagents active:** {}\n",
+        items.join(" · ")
+    ))
 }
 
 fn acp_usage_listing(state: &SessionUiState) -> String {
@@ -3794,9 +3875,12 @@ mod tests {
         let mut mapper = EventMapper::new("parent".into(), AcpProfile::Standard);
         let member: crate::protocol::SwarmMemberStatus = serde_json::from_value(json!({
             "session_id": "child", "status": "running", "friendly_name": "Researcher",
+            "todo_progress": [1, 3],
             "report_back_to_session_id": "parent", "runtime": {"model":"deepseek-v4.1-flash"}
         }))
         .unwrap();
+        let progress = active_swarm_progress("parent", std::slice::from_ref(&member)).unwrap();
+        assert!(progress.contains("Researcher: running (1/3 tasks)"));
         let event = mapper.map_event(ServerEvent::SwarmStatus {
             members: vec![member.clone()],
         });
@@ -3811,6 +3895,7 @@ mod tests {
         );
         let mut unrelated = member;
         unrelated.report_back_to_session_id = Some("someone-else".into());
+        assert!(active_swarm_progress("parent", std::slice::from_ref(&unrelated)).is_none());
         assert!(
             mapper
                 .map_event(ServerEvent::SwarmStatus {
