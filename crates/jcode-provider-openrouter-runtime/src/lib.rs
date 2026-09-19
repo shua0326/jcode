@@ -461,6 +461,43 @@ fn apply_opencode_session_header(
 
 pub(crate) const OPENCODE_SESSION_HEADER: &str = "x-opencode-session";
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum OpenAiCompatibleWireApi {
+    ChatCompletions,
+    Responses,
+    /// Anthropic Messages API. Aggregator gateways serve some models through
+    /// it (OpenCode Go's `union-alpha`, `minimax-m3`, `qwen3.8-flash`); sending
+    /// `chat/completions` to those models returns a bare HTTP 500.
+    Messages,
+}
+
+impl OpenAiCompatibleWireApi {
+    /// Map the wire API a catalog published for a model.
+    fn from_published(value: Option<&str>) -> Option<Self> {
+        match jcode_provider_core::WireApi::from_str(value?)? {
+            jcode_provider_core::WireApi::ChatCompletions => Some(Self::ChatCompletions),
+            jcode_provider_core::WireApi::Responses => Some(Self::Responses),
+            jcode_provider_core::WireApi::Messages => Some(Self::Messages),
+        }
+    }
+
+    pub(crate) fn path(self) -> &'static str {
+        match self {
+            Self::ChatCompletions => "chat/completions",
+            Self::Responses => "responses",
+            Self::Messages => "messages",
+        }
+    }
+
+    pub(crate) fn log_name(self) -> &'static str {
+        match self {
+            Self::ChatCompletions => "chat_completions",
+            Self::Responses => "responses",
+            Self::Messages => "messages",
+        }
+    }
+}
+
 #[derive(Debug, Clone)]
 enum ProviderAuth {
     AuthorizationBearer {
@@ -495,6 +532,20 @@ impl ProviderAuth {
         }
     }
 
+    /// Auth header for the Anthropic Messages wire, which wants `x-api-key`
+    /// instead of the profile's bearer token.
+    fn messages_auth_header(&self) -> Option<(HeaderName, String)> {
+        match self {
+            Self::AuthorizationBearer { token, .. } => {
+                Some((HeaderName::from_static("x-api-key"), token.clone()))
+            }
+            Self::HeaderValue {
+                header_name, value, ..
+            } => Some((header_name.clone(), value.clone())),
+            Self::None { .. } | Self::AzureEntra { .. } => None,
+        }
+    }
+
     fn label(&self) -> &str {
         match self {
             Self::AuthorizationBearer { label, .. } => label,
@@ -502,6 +553,28 @@ impl ProviderAuth {
             Self::AzureEntra { label } => label,
             Self::None { label } => label,
         }
+    }
+}
+
+/// Value sent as `anthropic-version` on the Messages wire.
+pub(crate) const ANTHROPIC_VERSION: &str = "2023-06-01";
+
+/// `max_tokens` sent on the Messages wire when the profile sets no cap.
+pub(crate) const MESSAGES_DEFAULT_MAX_TOKENS: u32 = 8192;
+
+/// Token budget for a jcode effort level on the Messages wire.
+///
+/// Gateways publish effort names (`low`/`medium`/`high`) while the Messages API
+/// takes a thinking token budget, so this is jcode's translation between them.
+/// `none` sends no thinking config at all.
+pub(crate) fn messages_thinking_budget_for_effort(effort: &str) -> Option<u32> {
+    match effort.trim().to_ascii_lowercase().as_str() {
+        "minimal" => Some(1024),
+        "low" => Some(2048),
+        "medium" => Some(8192),
+        "high" => Some(16384),
+        "xhigh" | "max" => Some(32768),
+        _ => None,
     }
 }
 
@@ -943,44 +1016,64 @@ pub struct OpenRouterProvider {
 }
 
 impl OpenRouterProvider {
-    /// Apply a real (already resolved) effort without changing the stored swarm mode.
-    fn apply_resolved_reasoning_effort(
-        &self,
-        request: &mut Value,
-        effort: &str,
-        strict_openai_schema: bool,
-    ) -> bool {
-        if self.supports_deepseek_reasoning_effort() {
-            let effort = match effort {
-                "minimal" => "low",
-                "xhigh" => "high",
-                other => other,
-            };
-            if effort == "none" {
-                return false;
-            }
-            request["reasoning_effort"] = serde_json::json!(effort);
-        } else if self.supports_openai_reasoning_effort() {
-            // Strict endpoints such as Mistral reject the UX alias `max`.
-            let effort = if strict_openai_schema && effort == "max" {
-                "xhigh"
-            } else {
-                effort
-            };
-            if effort == "none" {
-                return false;
-            }
-            request["reasoning_effort"] = serde_json::json!(effort);
-        } else if Self::profile_supports_unified_reasoning(
-            self.profile_id.as_deref(),
-            self.send_openrouter_headers,
-        ) {
-            let effort = if effort == "max" { "xhigh" } else { effort };
-            request["reasoning"] = serde_json::json!({"effort": effort});
-        } else {
-            return false;
+    fn is_opencode_go_profile(&self) -> bool {
+        if self
+            .profile_id
+            .as_deref()
+            .is_some_and(|id| id.eq_ignore_ascii_case("opencode-go"))
+        {
+            return true;
         }
-        true
+
+        let Ok(url) = reqwest::Url::parse(&self.api_base) else {
+            return false;
+        };
+        matches!(url.host_str(), Some("opencode.ai"))
+            && url.path().trim_end_matches('/').ends_with("/zen/go/v1")
+    }
+
+    fn model_is_muse_spark_family(model: &str) -> bool {
+        model.trim().to_ascii_lowercase().starts_with("muse-spark-")
+    }
+
+    fn wire_api_for_model(&self, model: &str) -> OpenAiCompatibleWireApi {
+        // Published gateway metadata wins: models.dev states which AI-SDK
+        // package each model is served with, and aggregator gateways mix them
+        // inside one profile. Name heuristics below are the fallback for
+        // catalogs that do not publish the package.
+        //
+        // Follow-up (not implemented): when no metadata is published and the
+        // chosen shape fails with an opaque error, retry the other shapes once
+        // and remember the one that worked. That would cover gateways whose
+        // catalog entry is missing or wrong, at the cost of one wasted request
+        // per new model.
+        if let Some(api) = self.published_wire_api(model) {
+            return api;
+        }
+        if self.is_opencode_go_profile() && Self::model_is_muse_spark_family(model) {
+            return OpenAiCompatibleWireApi::Responses;
+        }
+        OpenAiCompatibleWireApi::ChatCompletions
+    }
+
+    /// Wire API for `model` from the models.dev catalog, when published.
+    fn published_wire_api(&self, model: &str) -> Option<OpenAiCompatibleWireApi> {
+        let capability =
+            jcode_base::model_pricing::lookup_capability(self.catalog_provider_key(), model)?;
+        OpenAiCompatibleWireApi::from_published(capability.wire_api.as_deref())
+    }
+
+    /// models.dev provider id for this runtime: the profile id when it is a
+    /// direct compatible profile, else the shared `openrouter` entry.
+    fn catalog_provider_key(&self) -> &str {
+        self.profile_id.as_deref().unwrap_or("openrouter")
+    }
+
+    fn supports_muse_spark_reasoning_effort(&self) -> bool {
+        self.is_opencode_go_profile()
+            && Self::model_is_muse_spark_family(&self.model_snapshot())
+            && self.model_reasoning_support() != Some(false)
+            && self.reasoning_effort_support != Some(false)
     }
 
     fn profile_supports_reasoning_effort(profile_id: Option<&str>) -> bool {
@@ -1086,19 +1179,56 @@ impl OpenRouterProvider {
     }
 
     pub(crate) fn supports_any_reasoning_effort(&self) -> bool {
-        self.supports_deepseek_reasoning_effort()
-            || self.supports_openai_reasoning_effort()
-            || Self::profile_supports_unified_reasoning(
-                self.profile_id.as_deref(),
-                self.send_openrouter_headers,
-            )
+        !self.model_effort_ladder().is_empty()
+    }
+
+    /// Effort ladder for the active model: jcode's per-family heuristic when it
+    /// has one, else the ladder the model catalog publishes (which is how a
+    /// gateway-only model such as OpenCode Go's `union-alpha` gains selectable
+    /// thinking levels without a jcode release).
+    pub(crate) fn model_effort_ladder(&self) -> Vec<&'static str> {
+        let heuristic = if self.supports_muse_spark_reasoning_effort() {
+            jcode_provider_core::MUSE_SPARK_SELECTABLE_EFFORTS.to_vec()
+        } else if self.supports_deepseek_reasoning_effort() {
+            jcode_provider_core::DEEPSEEK_SELECTABLE_EFFORTS.to_vec()
+        } else if self.supports_openai_reasoning_effort() {
+            jcode_provider_core::OPENAI_SELECTABLE_EFFORTS.to_vec()
+        } else if Self::profile_supports_unified_reasoning(
+            self.profile_id.as_deref(),
+            self.send_openrouter_headers,
+        ) {
+            jcode_provider_core::OPENROUTER_SELECTABLE_EFFORTS.to_vec()
+        } else {
+            Vec::new()
+        };
+        if !heuristic.is_empty() {
+            return heuristic;
+        }
+        jcode_base::model_pricing::discovered_efforts(
+            self.catalog_provider_key(),
+            &self.model_snapshot(),
+        )
     }
 
     pub(crate) fn normalize_reasoning_effort_for_self(&self, effort: &str) -> Option<String> {
-        if self.supports_deepseek_reasoning_effort() {
+        if self.supports_muse_spark_reasoning_effort() {
+            Self::normalize_muse_spark_reasoning_effort(effort)
+        } else if self.supports_deepseek_reasoning_effort() {
             Self::normalize_reasoning_effort(effort)
         } else if self.supports_openai_reasoning_effort() {
             Self::normalize_openai_reasoning_effort(effort)
+        } else if Self::profile_supports_unified_reasoning(
+            self.profile_id.as_deref(),
+            self.send_openrouter_headers,
+        ) {
+            Self::normalize_unified_reasoning_effort(effort)
+        } else if !self.model_effort_ladder().is_empty() {
+            // Catalog-declared ladder: accept only what it publishes, so an
+            // unsupported level is rejected instead of reaching the gateway.
+            let value = effort.trim().to_ascii_lowercase();
+            self.model_effort_ladder()
+                .contains(&value.as_str())
+                .then_some(value)
         } else {
             Self::normalize_unified_reasoning_effort(effort)
         }
@@ -1178,6 +1308,25 @@ impl OpenRouterProvider {
             other => {
                 jcode_base::logging::info(&format!(
                     "Warning: Ignoring unsupported OpenAI-compatible reasoning effort '{}'.",
+                    other
+                ));
+                None
+            }
+        }
+    }
+
+    fn normalize_muse_spark_reasoning_effort(raw: &str) -> Option<String> {
+        let value = raw.trim().to_ascii_lowercase();
+        if value.is_empty() {
+            return None;
+        }
+        match value.as_str() {
+            "none" | "minimal" | "low" | "medium" | "high" | "xhigh" | "swarm" | "swarm-deep" => {
+                Some(value)
+            }
+            other => {
+                jcode_base::logging::info(&format!(
+                    "Warning: Ignoring unsupported Muse Spark reasoning effort '{}'; expected none|minimal|low|medium|high|xhigh.",
                     other
                 ));
                 None

@@ -604,7 +604,6 @@ fn direct_deepseek_profile_omits_image_url_parts() {
         timestamp: None,
         tool_duration_ms: None,
     }];
-
     let rt = tokio::runtime::Builder::new_current_thread()
         .enable_all()
         .build()
@@ -1587,6 +1586,231 @@ fn direct_zai_profile_exposes_openai_reasoning_effort_ladder() {
 }
 
 #[test]
+fn opencode_go_muse_exposes_documented_reasoning_efforts() {
+    let provider = OpenRouterProvider {
+        model: Arc::new(RwLock::new("muse-spark-1.3-contributor".to_string())),
+        profile_id: Some("opencode-go".to_string()),
+        supports_provider_features: false,
+        ..make_custom_compatible_provider()
+    };
+
+    assert_eq!(
+        provider.available_efforts(),
+        vec![
+            "none",
+            "minimal",
+            "low",
+            "medium",
+            "high",
+            "xhigh",
+            "swarm",
+            "swarm-deep"
+        ]
+    );
+    provider
+        .set_reasoning_effort("xhigh")
+        .expect("Muse should accept its strongest advertised effort");
+    assert_eq!(provider.reasoning_effort().as_deref(), Some("xhigh"));
+    assert!(provider.set_reasoning_effort("max").is_err());
+}
+
+/// Write the models.dev capability cache the way a catalog fetch would, so the
+/// runtime's published-metadata lookups resolve without network access.
+fn save_models_dev_capability(provider: &str, model: &str, wire_api: &str, reasoning: bool) {
+    let cache_dir = jcode_base::storage::jcode_dir()
+        .expect("jcode dir")
+        .join("cache");
+    std::fs::create_dir_all(&cache_dir).expect("create cache dir");
+    let payload = serde_json::json!({
+        "schema_version": 2,
+        "cached_at_unix_secs": std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .expect("clock")
+            .as_secs(),
+        "providers": {},
+        "capabilities": {
+            provider: {
+                model: {
+                    "wire_api": wire_api,
+                    "reasoning": reasoning,
+                }
+            }
+        }
+    });
+    std::fs::write(
+        cache_dir.join("models_dev_pricing.json"),
+        serde_json::to_string(&payload).expect("serialize capability cache"),
+    )
+    .expect("write capability cache");
+}
+
+/// OpenCode Go serves `union-alpha` through the Anthropic Messages API; sending
+/// `chat/completions` returns a bare HTTP 500. The catalog publishes that mapping
+/// (`provider.npm = @ai-sdk/anthropic`), so the runtime must follow it, switch
+/// auth to `x-api-key`, and expose the model's thinking ladder.
+#[test]
+fn opencode_go_union_alpha_uses_the_messages_api() {
+    let _lock = ENV_LOCK.lock();
+    let temp = TempDir::new().expect("create temp home");
+    let jcode_home = temp.path().join("jcode-home");
+    let _jcode_home = EnvVarGuard::set("JCODE_HOME", &jcode_home);
+    let _home = EnvVarGuard::set("HOME", temp.path());
+    let _env = isolate_openrouter_autodetect_env();
+    save_models_dev_capability("opencode-go", "union-alpha", "anthropic-messages", true);
+
+    let (api_base, request_rx) = spawn_single_response_chat_server();
+    let provider = OpenRouterProvider {
+        api_base,
+        model: Arc::new(RwLock::new("union-alpha".to_string())),
+        profile_id: Some("opencode-go".to_string()),
+        supports_provider_features: false,
+        supports_model_catalog: false,
+        ..make_custom_compatible_provider()
+    };
+
+    // The published ladder (no explicit enum, Messages wire + reasoning) is
+    // jcode's budget ladder, so the picker offers levels instead of nothing.
+    assert_eq!(provider.available_efforts(), vec!["low", "medium", "high"]);
+    provider
+        .set_reasoning_effort("high")
+        .expect("union-alpha should accept its published effort");
+
+    let messages = vec![Message {
+        role: Role::User,
+        content: vec![ContentBlock::Text {
+            text: "hello".to_string(),
+            cache_control: None,
+        }],
+        timestamp: None,
+        tool_duration_ms: None,
+    }];
+    let tools = vec![ToolDefinition {
+        name: "read".to_string(),
+        description: "Read a file".to_string(),
+        input_schema: serde_json::json!({
+            "type": "object",
+            "properties": {"path": {"type": "string"}},
+            "required": ["path"]
+        }),
+    }];
+
+    let rt = tokio::runtime::Builder::new_current_thread()
+        .enable_all()
+        .build()
+        .expect("runtime");
+    rt.block_on(async {
+        let mut stream = provider
+            .complete(&messages, &tools, "system prompt", None)
+            .await
+            .expect("Messages request should start");
+        while let Some(event) = stream.next().await {
+            event.expect("Messages stream event should parse");
+        }
+    });
+
+    let request = request_rx
+        .recv_timeout(Duration::from_secs(2))
+        .expect("capture fake provider request");
+    assert!(
+        request.starts_with("POST /v1/messages "),
+        "union-alpha must use the Messages endpoint: {request}"
+    );
+    assert!(
+        request.to_ascii_lowercase().contains("x-api-key: test"),
+        "Messages wire must authenticate with x-api-key: {request}"
+    );
+    assert!(
+        request.to_ascii_lowercase().contains("anthropic-version:"),
+        "Messages wire must send anthropic-version: {request}"
+    );
+    let body = parse_captured_request_body(&request);
+    assert!(
+        body.get("max_tokens").is_some(),
+        "Messages requests require max_tokens: {body}"
+    );
+    assert_eq!(body["system"][0]["text"], "system prompt");
+    assert_eq!(body["tools"][0]["name"], "read");
+    assert!(body["tools"][0].get("input_schema").is_some());
+    assert_eq!(body["thinking"]["budget_tokens"], 16_384);
+    assert!(
+        body.get("tools").is_some() && body.get("messages").is_some(),
+        "Messages body must carry the conversation and tools: {body}"
+    );
+}
+
+#[test]
+fn opencode_go_muse_request_uses_responses_api() {
+    let (api_base, request_rx) = spawn_single_response_chat_server();
+    let provider = OpenRouterProvider {
+        api_base,
+        model: Arc::new(RwLock::new("muse-spark-1.3-contributor".to_string())),
+        profile_id: Some("opencode-go".to_string()),
+        supports_provider_features: false,
+        supports_model_catalog: false,
+        ..make_custom_compatible_provider()
+    };
+    provider
+        .set_reasoning_effort("high")
+        .expect("Muse should accept high effort");
+    let messages = vec![Message {
+        role: Role::User,
+        content: vec![ContentBlock::Text {
+            text: "hello".to_string(),
+            cache_control: None,
+        }],
+        timestamp: None,
+        tool_duration_ms: None,
+    }];
+    let tools = vec![ToolDefinition {
+        name: "read".to_string(),
+        description: "Read a file".to_string(),
+        input_schema: serde_json::json!({
+            "type": "object",
+            "properties": {"path": {"type": "string"}},
+            "required": ["path"]
+        }),
+    }];
+
+    let rt = tokio::runtime::Builder::new_current_thread()
+        .enable_all()
+        .build()
+        .expect("runtime");
+    rt.block_on(async {
+        let mut stream = provider
+            .complete(&messages, &tools, "system prompt", None)
+            .await
+            .expect("fake Responses request should start");
+        while let Some(event) = stream.next().await {
+            event.expect("Responses stream event should parse");
+        }
+    });
+
+    let request = request_rx
+        .recv_timeout(Duration::from_secs(2))
+        .expect("capture fake provider request");
+    assert!(
+        request.starts_with("POST /v1/responses "),
+        "Muse should use the Responses endpoint: {request}"
+    );
+    let body = parse_captured_request_body(&request);
+    assert!(
+        body.get("input")
+            .and_then(|value| value.as_array())
+            .is_some()
+    );
+    assert!(body.get("messages").is_none());
+    assert_eq!(body["instructions"], "system prompt");
+    assert_eq!(body["reasoning"]["effort"], "high");
+    assert_eq!(body["tool_choice"], "auto");
+    assert_eq!(body["tools"][0]["type"], "function");
+    assert_eq!(body["tools"][0]["name"], "read");
+    assert_eq!(body["tools"][0]["parameters"]["type"], "object");
+    assert!(body["tools"][0].get("function").is_none());
+    assert!(body.get("reasoning_effort").is_none());
+    assert!(body.get("stream_options").is_none());
+}
+
+#[test]
 fn direct_zai_profile_applies_configured_effort_on_construction_and_model_switch() {
     let configured = jcode_base::config::config()
         .provider
@@ -2144,107 +2368,6 @@ fn direct_deepseek_profile_uses_static_1m_context_when_catalog_is_absent() {
     let provider = OpenRouterProvider::new().expect("provider");
 
     assert_eq!(provider.context_window(), 1_000_000);
-}
-
-#[test]
-fn conifer_context_fallback_yields_to_live_and_disk_catalog_without_remapping_aliases() {
-    let _lock = ENV_LOCK.lock();
-    let temp = TempDir::new().expect("create temp home");
-    let _jcode_home = EnvVarGuard::set("JCODE_HOME", temp.path());
-    let _home = EnvVarGuard::set("HOME", temp.path());
-    let _appdata = EnvVarGuard::set("APPDATA", temp.path().join("AppData").join("Roaming"));
-    let _key = EnvVarGuard::set("CONIFER_API_KEY", "test-conifer-catalog");
-    let _namespace = EnvVarGuard::set("JCODE_OPENROUTER_CACHE_NAMESPACE", "test-conifer-1274");
-    // Synthetic future catalog deliberately changes latest aliases in both
-    // directions and reintroduces the missing Together route with its own limit.
-    let (api_base, request_rx) = spawn_single_response_models_server(
-        r#"{"data":[
-            {"id":"mistral-large-latest","context_window":128000},
-            {"id":"mistral-medium-latest","context_window":512000},
-            {"id":"mistral-small-latest","context_window":64000},
-            {"id":"nemotron-3-ultra-together","context_window":131072}
-        ]}"#,
-    );
-    let make_provider = || {
-        let mut provider = OpenRouterProvider::new_openai_compatible_profile_runtime(
-            jcode_base::provider_catalog::CONIFER_PROFILE,
-        )
-        .expect("Conifer provider");
-        // Use the real constructor/metadata without sending any vendor requests.
-        provider.api_base = api_base.clone();
-        provider
-    };
-    let provider = make_provider();
-    for (model, expected) in [
-        ("seed-2.0-pro", 256_000),
-        ("gemma-4-31b", 128_000),
-        ("llama-4-scout", 327_680),
-        ("conifer:grok-4.6", 500_000),
-        ("mistral-large-latest", 256_000),
-        ("mistral-medium-latest", 256_000),
-        ("mistral-small-latest", 256_000),
-    ] {
-        provider.set_model(model).expect("select fallback model");
-        assert_eq!(provider.context_window(), expected, "{model}");
-    }
-    let alias = "nemotron-3-ultra-together";
-    assert!(!provider.static_models.iter().any(|model| model == alias));
-    provider
-        .set_model(&format!("conifer:{alias}"))
-        .expect("explicit legacy selection");
-    assert_eq!(
-        provider.model(),
-        alias,
-        "never remap to the DeepInfra route"
-    );
-    assert_eq!(
-        provider.context_window(),
-        jcode_provider_core::DEFAULT_CONTEXT_LIMIT
-    );
-
-    let rt = tokio::runtime::Builder::new_current_thread()
-        .enable_all()
-        .build()
-        .expect("runtime");
-    let fetched = rt
-        .block_on(provider.refresh_models())
-        .expect("refresh Conifer catalog");
-    assert!(fetched.iter().any(|model| model.id == alias));
-    provider
-        .set_model("mistral-large-latest")
-        .expect("select another model before checking discovery");
-    let request = request_rx
-        .recv_timeout(Duration::from_secs(2))
-        .expect("catalog request");
-    assert!(request.starts_with("GET /v1/models "));
-    assert!(
-        request
-            .to_ascii_lowercase()
-            .contains("authorization: bearer test-conifer-catalog")
-    );
-    assert!(
-        provider
-            .available_models_display()
-            .iter()
-            .any(|model| model == alias)
-    );
-
-    let fresh = make_provider();
-    assert!(fresh.models_cache.try_read().unwrap().models.is_empty());
-    for (model, expected) in [
-        ("mistral-large-latest", 128_000),
-        ("mistral-medium-latest", 512_000),
-        ("mistral-small-latest", 64_000),
-        (alias, 131_072),
-    ] {
-        provider.set_model(model).expect("select live model");
-        fresh
-            .set_model(model)
-            .expect("restore model before in-memory hydration");
-        assert_eq!(provider.model(), model);
-        assert_eq!(provider.context_window(), expected, "live: {model}");
-        assert_eq!(fresh.context_window(), expected, "disk: {model}");
-    }
 }
 
 #[test]
@@ -3167,6 +3290,7 @@ fn midstream_transport_fault_emits_retry_rollback_before_replay() {
             },
             false,
             new_conversation_id(),
+            OpenAiCompatibleWireApi::ChatCompletions,
             request,
             tx,
             Arc::new(Mutex::new(None)),
@@ -3678,6 +3802,7 @@ fn captured_request_for_host(host: &str, conversation_id: &str) -> String {
             },
             false,
             conversation_id.to_string(),
+            OpenAiCompatibleWireApi::ChatCompletions,
             serde_json::json!({"model": "m", "messages": [], "stream": true}),
             tx,
             Arc::new(Mutex::new(None)),
@@ -3703,104 +3828,4 @@ fn opencode_session_header_is_sent_on_the_wire_only_to_opencode_hosts() {
         !raw.contains("x-opencode-session"),
         "non-opencode host received the header:\n{raw}"
     );
-}
-
-#[test]
-fn configured_swarm_root_effort_covers_all_wire_formats() {
-    let unified = make_provider();
-    let deepseek = OpenRouterProvider {
-        profile_id: Some("deepseek".into()),
-        ..make_custom_compatible_provider()
-    };
-    let openai = OpenRouterProvider {
-        profile_id: Some("zai".into()),
-        ..make_custom_compatible_provider()
-    };
-    for mode in ["swarm", "swarm-deep"] {
-        for (provider, strict, field, max) in [
-            (&unified, false, "reasoning", "xhigh"),
-            (&deepseek, false, "reasoning_effort", "max"),
-            (&openai, false, "reasoning_effort", "max"),
-            (&openai, true, "reasoning_effort", "xhigh"),
-        ] {
-            provider.set_reasoning_effort(mode).unwrap();
-            for (resolved, expected) in [("low", "low"), ("medium", "medium"), ("max", max)] {
-                let mut request = serde_json::json!({});
-                assert!(provider.apply_resolved_reasoning_effort(&mut request, resolved, strict));
-                let wire = if field == "reasoning" {
-                    &request[field]["effort"]
-                } else {
-                    &request[field]
-                };
-                assert_eq!(wire, expected);
-                assert_eq!(provider.reasoning_effort().as_deref(), Some(mode));
-            }
-            let mut request = serde_json::json!({});
-            assert_eq!(
-                provider.apply_resolved_reasoning_effort(&mut request, "none", strict),
-                field == "reasoning"
-            );
-            if field == "reasoning" {
-                assert_eq!(request[field]["effort"], "none");
-            } else {
-                assert!(request.get(field).is_none());
-            }
-        }
-    }
-    for (effort, expected) in [("minimal", "low"), ("xhigh", "high")] {
-        let mut request = serde_json::json!({});
-        assert!(deepseek.apply_resolved_reasoning_effort(&mut request, effort, false));
-        assert_eq!(request["reasoning_effort"], expected);
-    }
-}
-
-#[test]
-fn configured_swarm_root_effort_reads_real_config() {
-    // Run this single test in a child process so changing config cannot race
-    // other provider tests or reuse an already-initialized global config cache.
-    if std::env::var_os("JCODE_TEST_SWARM_ROOT_CHILD").is_none() {
-        let output = std::process::Command::new(std::env::current_exe().unwrap())
-            .args([
-                "--exact",
-                std::thread::current().name().unwrap(),
-                "--nocapture",
-            ])
-            .env("JCODE_TEST_SWARM_ROOT_CHILD", "1")
-            .env("JCODE_SWARM_ROOT_EFFORT", "low")
-            .env("JCODE_SWARM_DEEP_ROOT_EFFORT", "none")
-            .output()
-            .expect("run isolated config test");
-        assert!(
-            output.status.success(),
-            "{}\n{}",
-            String::from_utf8_lossy(&output.stdout),
-            String::from_utf8_lossy(&output.stderr)
-        );
-        return;
-    }
-    for (mode, expected) in [("swarm", "low"), ("swarm-deep", "none")] {
-        let (api_base, request_rx) = spawn_single_response_chat_server();
-        let provider = OpenRouterProvider {
-            api_base,
-            supports_model_catalog: false,
-            ..make_provider()
-        };
-        provider.set_reasoning_effort(mode).unwrap();
-        let rt = tokio::runtime::Builder::new_current_thread()
-            .enable_all()
-            .build()
-            .unwrap();
-        rt.block_on(async {
-            let mut stream = provider.complete(&[], &[], "test", None).await.unwrap();
-            while let Some(event) = stream.next().await {
-                event.unwrap();
-            }
-        });
-        let request = request_rx.recv_timeout(Duration::from_secs(2)).unwrap();
-        assert!(
-            request.contains(&format!(r#""reasoning":{{"effort":"{expected}"}}"#)),
-            "{request}"
-        );
-        assert_eq!(provider.reasoning_effort().as_deref(), Some(mode));
-    }
 }

@@ -42,6 +42,7 @@ impl Provider for OpenRouterProvider {
         _resume_session_id: Option<&str>,
     ) -> Result<EventStream> {
         let model = self.model.read().await.clone();
+        let wire_api = self.wire_api_for_model(&model);
         let reasoning_effort = self.reasoning_effort();
         let thinking_override = Self::thinking_override();
         // Moonshot's dedicated Kimi coding endpoint enables thinking server-side
@@ -94,61 +95,183 @@ impl Provider for OpenRouterProvider {
             false
         };
 
-        let api_messages = jcode_provider_openrouter::request::build_chat_messages(
-            &effective_messages,
-            system,
-            allow_reasoning,
-            include_reasoning_content,
-            allow_image_input,
-        );
-
-        // Build tools in OpenAI format
-        let api_tools: Vec<Value> = tools
-            .iter()
-            .map(|t| {
-                serde_json::json!({
-                    "type": "function",
-                    "function": {
-                        "name": t.name,
-                        // Prompt-visible. Approximate token cost for this field:
-                        // t.description_token_estimate().
-                        "description": t.description,
-                        // Sanitized so bare `{"type":"object"}` MCP tool
-                        // schemas do not 400 on strict endpoints (issue #446).
-                        "parameters": jcode_provider_openrouter::request::sanitize_tool_parameters_schema(&t.input_schema),
+        let (mut request, input_items, system_value, api_tools) = match wire_api {
+            OpenAiCompatibleWireApi::ChatCompletions => {
+                let api_messages = jcode_provider_openrouter::request::build_chat_messages(
+                    &effective_messages,
+                    system,
+                    allow_reasoning,
+                    include_reasoning_content,
+                    allow_image_input,
+                );
+                let api_tools = tools
+                    .iter()
+                    .map(|t| {
+                        serde_json::json!({
+                            "type": "function",
+                            "function": {
+                                "name": t.name,
+                                // Prompt-visible. Approximate token cost for this field:
+                                // t.description_token_estimate().
+                                "description": t.description,
+                                // Sanitized so bare `{"type":"object"}` MCP tool
+                                // schemas do not 400 on strict endpoints (issue #446).
+                                "parameters": jcode_provider_openrouter::request::sanitize_tool_parameters_schema(&t.input_schema),
+                            }
+                        })
+                    })
+                    .collect::<Vec<Value>>();
+                let system_value = api_messages
+                    .first()
+                    .filter(|message| {
+                        message.get("role").and_then(|role| role.as_str()) == Some("system")
+                    })
+                    .cloned();
+                let mut request = serde_json::json!({
+                    "model": model,
+                    "messages": api_messages,
+                    "stream": true,
+                });
+                if !self.supports_provider_features {
+                    request["stream_options"] = serde_json::json!({
+                        "include_usage": true,
+                    });
+                }
+                if let Some(max_tokens) = self.max_tokens {
+                    request["max_tokens"] = serde_json::json!(max_tokens);
+                }
+                if !api_tools.is_empty() {
+                    request["tools"] = serde_json::json!(&api_tools);
+                    if self.profile_id.as_deref() != Some("fpt")
+                        && !self.api_base.contains("fptcloud.com")
+                    {
+                        request["tool_choice"] = serde_json::json!("auto");
                     }
-                })
-            })
-            .collect();
+                }
+                (request, api_messages, system_value, api_tools)
+            }
+            OpenAiCompatibleWireApi::Responses => {
+                let input = jcode_provider_openai::build_responses_input(&effective_messages);
+                let api_tools = jcode_provider_openai::build_tools(tools);
+                let system_value = (!system.is_empty()).then(|| serde_json::json!(system));
+                let mut request = serde_json::json!({
+                    "model": model,
+                    "input": input,
+                    "stream": true,
+                });
+                if let Some(system_value) = system_value.as_ref() {
+                    request["instructions"] = system_value.clone();
+                }
+                if let Some(max_tokens) = self.max_tokens {
+                    request["max_output_tokens"] = serde_json::json!(max_tokens);
+                }
+                if !api_tools.is_empty() {
+                    request["tools"] = serde_json::json!(&api_tools);
+                    request["tool_choice"] = serde_json::json!("auto");
+                }
+                (request, input, system_value, api_tools)
+            }
+            OpenAiCompatibleWireApi::Messages => {
+                let api_messages: Vec<Value> =
+                    jcode_provider_anthropic::format_messages(&effective_messages, false)
+                        .iter()
+                        .filter_map(|message| serde_json::to_value(message).ok())
+                        .collect();
+                let api_tools: Vec<Value> =
+                    jcode_provider_anthropic::format_tools(tools, false, false)
+                        .iter()
+                        .filter_map(|tool| serde_json::to_value(tool).ok())
+                        .collect();
+                let system_value = jcode_provider_anthropic::build_system_param(
+                    system, false, false,
+                )
+                .map(|system| serde_json::to_value(system).unwrap_or(serde_json::Value::Null));
+                let mut request = serde_json::json!({
+                    "model": model,
+                    // The Messages API requires max_tokens. Gateways that serve
+                    // this shape publish no separate cap, so fall back to the
+                    // Anthropic runtime's default.
+                    "max_tokens": self.max_tokens.unwrap_or(MESSAGES_DEFAULT_MAX_TOKENS),
+                    "messages": serde_json::json!(&api_messages),
+                    "stream": true,
+                });
+                if let Some(system_value) = system_value.as_ref() {
+                    request["system"] = system_value.clone();
+                }
+                if !api_tools.is_empty() {
+                    request["tools"] = serde_json::json!(&api_tools);
+                }
+                if let Some(budget) = reasoning_effort
+                    .as_deref()
+                    .and_then(messages_thinking_budget_for_effort)
+                {
+                    request["thinking"] = serde_json::json!({
+                        "type": "enabled",
+                        "budget_tokens": budget,
+                    });
+                }
+                (request, api_messages, system_value, api_tools)
+            }
+        };
 
-        // Build request
-        let mut request = serde_json::json!({
-            "model": model,
-            "messages": api_messages,
-            "stream": true,
-        });
-
-        if !self.supports_provider_features {
-            request["stream_options"] = serde_json::json!({
-                "include_usage": true,
-            });
-        }
-
-        if let Some(max_tokens) = self.max_tokens {
-            request["max_tokens"] = serde_json::json!(max_tokens);
-        }
-
-        let sent_reasoning_config = reasoning_effort.as_deref().is_some_and(|effort| {
-            let resolved =
-                jcode_base::prompt::swarm_root_reasoning_effort(effort).unwrap_or(effort);
-            self.apply_resolved_reasoning_effort(&mut request, resolved, strict_openai_schema)
-        });
-
-        if !api_tools.is_empty() {
-            request["tools"] = serde_json::json!(api_tools);
-            if self.profile_id.as_deref() != Some("fpt") && !self.api_base.contains("fptcloud.com")
+        let mut sent_reasoning_config = false;
+        if let Some(effort) = reasoning_effort.as_deref() {
+            if wire_api == OpenAiCompatibleWireApi::Responses
+                && self.supports_muse_spark_reasoning_effort()
             {
-                request["tool_choice"] = serde_json::json!("auto");
+                let effort = if jcode_base::prompt::is_swarm_effort(effort) {
+                    "xhigh"
+                } else {
+                    effort
+                };
+                if effort != "none" {
+                    request["reasoning"] = serde_json::json!({ "effort": effort });
+                    sent_reasoning_config = true;
+                }
+            } else if self.supports_deepseek_reasoning_effort() {
+                // The `swarm` sentinel maps to the strongest real effort.
+                let effort = if jcode_base::prompt::is_swarm_effort(effort) {
+                    "max"
+                } else {
+                    effort
+                };
+                if effort != "none" {
+                    request["reasoning_effort"] = serde_json::json!(effort);
+                    sent_reasoning_config = true;
+                }
+            } else if self.supports_openai_reasoning_effort() {
+                // GPT-family models on direct compat gateways (e.g. OpenCode
+                // Zen serving gpt-5.3-codex-spark) take the standard OpenAI
+                // `reasoning_effort` field with OpenAI's effort vocabulary.
+                let effort = if strict_openai_schema
+                    && (jcode_base::prompt::is_swarm_effort(effort) || effort == "max")
+                {
+                    // Strict OpenAI-schema endpoints such as Mistral document
+                    // xhigh as their strongest accepted value and reject the
+                    // jcode/OpenAI UX alias `max`.
+                    "xhigh"
+                } else if jcode_base::prompt::is_swarm_effort(effort) {
+                    "max"
+                } else {
+                    effort
+                };
+                if effort != "none" {
+                    request["reasoning_effort"] = serde_json::json!(effort);
+                    sent_reasoning_config = true;
+                }
+            } else if Self::profile_supports_unified_reasoning(
+                self.profile_id.as_deref(),
+                self.send_openrouter_headers,
+            ) {
+                let effort = if jcode_base::prompt::is_swarm_effort(effort) {
+                    "xhigh"
+                } else {
+                    effort
+                };
+                request["reasoning"] = serde_json::json!({
+                    "effort": effort,
+                });
+                sent_reasoning_config = true;
             }
         }
 
@@ -158,6 +281,7 @@ impl Provider for OpenRouterProvider {
         if let Some(enable) = thinking_enabled
             && !sent_reasoning_config
             && !strict_openai_schema
+            && wire_api == OpenAiCompatibleWireApi::ChatCompletions
         {
             request["thinking"] = serde_json::json!({
                 "type": if enable { "enabled" } else { "disabled" }
@@ -217,21 +341,7 @@ impl Provider for OpenRouterProvider {
             }
         }
 
-        let message_items = request
-            .get("messages")
-            .and_then(|value| value.as_array())
-            .cloned()
-            .unwrap_or_default();
         let tools_value = request.get("tools").cloned();
-        let system_value = message_items
-            .first()
-            .filter(|message| message.get("role").and_then(|role| role.as_str()) == Some("system"))
-            .cloned();
-        let tool_count = tools_value
-            .as_ref()
-            .and_then(|value| value.as_array())
-            .map(|tools| tools.len())
-            .unwrap_or(0);
         jcode_provider_core::fingerprint::log_provider_canonical_input(
             if self.supports_provider_features {
                 "openrouter"
@@ -239,12 +349,12 @@ impl Provider for OpenRouterProvider {
                 "openai-compatible"
             },
             &model,
-            "chat_completions",
+            wire_api.log_name(),
             &request,
-            &message_items,
+            &input_items,
             system_value.as_ref(),
             tools_value.as_ref(),
-            Some(tool_count),
+            Some(api_tools.len()),
             &[
                 ("cache_supported", cache_supported.to_string()),
                 ("cache_control_added", cache_control_added.to_string()),
@@ -285,6 +395,7 @@ impl Provider for OpenRouterProvider {
                 auth,
                 send_openrouter_headers,
                 conversation_id,
+                wire_api,
                 request_for_retries,
                 tx,
                 provider_pin,
@@ -407,7 +518,8 @@ impl Provider for OpenRouterProvider {
             self.clear_pin_if_model_changed(&model_id, true);
         }
 
-        if Self::profile_supports_openai_reasoning_effort(self.profile_id.as_deref())
+        if self.supports_muse_spark_reasoning_effort()
+            || Self::profile_supports_openai_reasoning_effort(self.profile_id.as_deref())
             || self
                 .model_reasoning_config()
                 .and_then(|config| config.1.as_ref())
@@ -448,14 +560,15 @@ impl Provider for OpenRouterProvider {
     fn set_reasoning_effort(&self, effort: &str) -> Result<()> {
         if !self.supports_any_reasoning_effort() {
             anyhow::bail!(
-                "Reasoning effort is not supported by the current model/profile. It works for OpenRouter, DeepSeek-family and GPT-family reasoning models, and profiles with supports_reasoning_effort = true."
+                "Reasoning effort is not supported by the current model/profile. It works for OpenRouter, OpenCode Go Muse Spark, DeepSeek-family and GPT-family reasoning models, and profiles with supports_reasoning_effort = true."
             );
         }
         let requested = effort.trim().to_ascii_lowercase();
         let mut accepted = self.available_efforts().contains(&requested.as_str());
-        if !self.supports_deepseek_reasoning_effort()
-            && !self.supports_openai_reasoning_effort()
-            && requested == "max"
+        if Self::profile_supports_unified_reasoning(
+            self.profile_id.as_deref(),
+            self.send_openrouter_headers,
+        ) && requested == "max"
         {
             accepted = true;
         }
@@ -475,18 +588,7 @@ impl Provider for OpenRouterProvider {
     }
 
     fn available_efforts(&self) -> Vec<&'static str> {
-        if self.supports_deepseek_reasoning_effort() {
-            jcode_provider_core::DEEPSEEK_SELECTABLE_EFFORTS.to_vec()
-        } else if self.supports_openai_reasoning_effort() {
-            jcode_provider_core::OPENAI_SELECTABLE_EFFORTS.to_vec()
-        } else if Self::profile_supports_unified_reasoning(
-            self.profile_id.as_deref(),
-            self.send_openrouter_headers,
-        ) {
-            jcode_provider_core::OPENROUTER_SELECTABLE_EFFORTS.to_vec()
-        } else {
-            vec![]
-        }
+        self.model_effort_ladder()
     }
 
     fn available_models(&self) -> Vec<&'static str> {
