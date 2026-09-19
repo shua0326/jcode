@@ -988,9 +988,16 @@ impl AcpRuntime {
             mapper.working_dir = active.working_dir.clone();
             loop {
                 // Session load/configuration can defer unsolicited events while
-                // waiting for its control replies. Consume that queue first, or
-                // an await wake that lands during attach never reaches Zed.
-                let event = match active.read_event().await {
+                // waiting for its control replies. Drain those first, but read
+                // live events directly: `read_event` would wait on this task's
+                // own event queue.
+                let event = match if let Some(event) =
+                    active.deferred_events.lock().await.pop_front()
+                {
+                    Ok(event)
+                } else {
+                    active.read_wire_event().await
+                } {
                     Ok(event) => event,
                     Err(err) => {
                         let _ = runtime.write_notification("session/update", json!({"sessionId":active.session_id,"update":agent_message_chunk("JCode disconnected. Reload this session to reconnect; do not resend a command until its state is checked.".into())})).await;
