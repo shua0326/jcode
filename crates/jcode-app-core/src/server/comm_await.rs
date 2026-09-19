@@ -13,13 +13,6 @@ use std::sync::Arc;
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 use tokio::sync::{RwLock, broadcast, mpsc};
 
-fn unix_time_ms() -> u64 {
-    SystemTime::now()
-        .duration_since(UNIX_EPOCH)
-        .unwrap_or_default()
-        .as_millis() as u64
-}
-
 pub(super) async fn awaited_member_statuses(
     req_session_id: &str,
     swarm_id: &str,
@@ -267,7 +260,7 @@ pub(super) async fn spawn_or_resume_await_members(
 
     tokio::spawn(async move {
         let mut event_rx = swarm_event_tx.subscribe();
-        let mut deadline = deadline_to_instant(state.deadline_unix_ms);
+        let deadline = deadline_to_instant(state.deadline_unix_ms);
 
         loop {
             let member_statuses = awaited_member_statuses(
@@ -335,22 +328,6 @@ pub(super) async fn spawn_or_resume_await_members(
 
             tokio::select! {
                 _ = tokio::time::sleep_until(deadline) => {
-                    // Extend only a watch that is still pending. Persisting a
-                    // stale copy back over a state that was finalized or removed
-                    // elsewhere would resurrect it and could double-fire the
-                    // promised notify/wake.
-                    let Some(mut latest) = refresh_pending_state(&state) else {
-                        await_members_runtime.clear_active(&key).await;
-                        return;
-                    };
-                    if latest.background && latest.wake {
-                        // No LLM call for unchanged worker state. Keep the persisted
-                        // watch alive so completion can still wake the coordinator.
-                        latest.deadline_unix_ms = unix_time_ms().saturating_add(60_000);
-                        let _ = save_state(&latest);
-                        deadline = tokio::time::Instant::now() + Duration::from_secs(60);
-                        continue;
-                    }
                     let summary = timeout_summary(&member_statuses);
                     finalize_await(&await_members_runtime, &state, false, member_statuses, summary).await;
                     return;
@@ -527,7 +504,7 @@ pub(super) async fn handle_comm_await_members(
         // immediately so the requesting turn stays responsive. Completion is
         // delivered later via notify/wake.
         if background {
-            if already_expired && !wake {
+            if already_expired {
                 let summary = timeout_summary(&initial_statuses);
                 finalize_await(
                     ctx.await_members_runtime,
@@ -707,7 +684,7 @@ pub(super) async fn resume_background_awaits(
         // Deadline passed while the server was down: the wait can never
         // resolve, so finalize it as a timeout now so the promised
         // notify/wake still fires instead of the await silently vanishing.
-        if state.deadline_unix_ms <= now_ms && !state.wake {
+        if state.deadline_unix_ms <= now_ms {
             let member_statuses = awaited_member_statuses(
                 &state.session_id,
                 &state.swarm_id,

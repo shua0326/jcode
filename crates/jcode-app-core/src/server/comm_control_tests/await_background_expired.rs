@@ -1,5 +1,5 @@
 #[tokio::test]
-async fn await_members_background_already_expired_answers_tool_call() {
+async fn await_members_background_expired_wake_answers_tool_call() {
     let (_env, _runtime_dir) = RuntimeEnvGuard::new();
     let swarm_id = "swarm-bg-expired";
     let requester = "req";
@@ -29,8 +29,8 @@ async fn await_members_background_already_expired_answers_tool_call() {
             created_at_unix_ms: now_ms.saturating_sub(120_000),
             deadline_unix_ms: now_ms.saturating_sub(1_000),
             background: true,
-            notify: false,
-            wake: false,
+            notify: true,
+            wake: true,
             final_response: None,
         },
     );
@@ -55,8 +55,8 @@ async fn await_members_background_already_expired_answers_tool_call() {
         None,
         Some(60),
         true,
-        false,
-        false,
+        true,
+        true,
         CommAwaitMembersContext {
             client_event_tx: &client_tx,
             swarm_members: &swarm_members,
