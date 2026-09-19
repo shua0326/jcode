@@ -2558,6 +2558,9 @@ impl EventMapper {
                         .as_deref()
                         .unwrap_or(&member.session_id);
                     let mut title = format!("🐝 {} · {}", compact_swarm_label(name), member.status);
+                    if let Some(model) = member.runtime.model.as_deref() {
+                        title.push_str(&format!(" · {model}"));
+                    }
                     if let Some((done, total)) = member.todo_progress {
                         title.push_str(&format!(" · {done}/{total} tasks"));
                     }
@@ -3801,7 +3804,10 @@ mod tests {
         });
         assert_eq!(event[0]["sessionUpdate"], "tool_call");
         assert_eq!(event[0]["status"], "in_progress");
-        assert_eq!(event[0]["title"], "🐝 Researcher · running · 1/3 tasks · 30s");
+        assert_eq!(
+            event[0]["title"],
+            "🐝 Researcher · running · deepseek-v4.1-flash · 1/3 tasks · 30s"
+        );
         assert_eq!(event[0]["rawInput"]["task"], "Investigate the failing UI test");
         assert_eq!(event[0]["rawOutput"]["detail"], "Reading AX evidence");
         assert!(
@@ -3828,7 +3834,10 @@ mod tests {
             members: vec![advanced],
         });
         assert_eq!(update[0]["sessionUpdate"], "tool_call_update");
-        assert_eq!(update[0]["title"], "🐝 Researcher · running · 2/3 tasks · 45s");
+        assert_eq!(
+            update[0]["title"],
+            "🐝 Researcher · running · deepseek-v4.1-flash · 2/3 tasks · 45s"
+        );
         let mut unrelated = member;
         unrelated.report_back_to_session_id = Some("someone-else".into());
         assert!(
