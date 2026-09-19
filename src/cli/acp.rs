@@ -986,16 +986,6 @@ impl AcpRuntime {
         let task = tokio::spawn(async move {
             let mut mapper = EventMapper::new(active.session_id.clone(), runtime.profile);
             mapper.working_dir = active.working_dir.clone();
-            // Member status is event-driven, so a card's elapsed time would
-            // otherwise freeze for as long as a worker stays quiet. Re-emit the
-            // stored snapshot on a slow tick so the display keeps advancing.
-            let mut swarm_tick = tokio::time::interval(std::time::Duration::from_secs(5));
-            swarm_tick.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
-            swarm_tick.tick().await;
-            let mut live_swarm: Option<(
-                Vec<crate::protocol::SwarmMemberStatus>,
-                std::time::Instant,
-            )> = None;
             loop {
                 // Session load/configuration can defer unsolicited events while
                 // waiting for its control replies. Drain those first, but read
@@ -1006,30 +996,7 @@ impl AcpRuntime {
                 {
                     Ok(event)
                 } else {
-                    tokio::select! {
-                        event = active.read_wire_event() => event,
-                        _ = swarm_tick.tick(), if live_swarm.is_some() => {
-                            if let Some((members, received_at)) = live_swarm.as_ref() {
-                                let refreshed = refresh_swarm_elapsed(
-                                    members,
-                                    received_at.elapsed().as_secs(),
-                                );
-                                if refreshed.iter().any(swarm_member_is_active)
-                                    && runtime
-                                        .emit_swarm_status(
-                                            &mut mapper,
-                                            &active.session_id,
-                                            &refreshed,
-                                        )
-                                        .await
-                                        .is_err()
-                                {
-                                    return;
-                                }
-                            }
-                            continue;
-                        }
-                    }
+                    active.read_wire_event().await
                 } {
                     Ok(event) => event,
                     Err(err) => {
@@ -1058,16 +1025,6 @@ impl AcpRuntime {
                                 .await;
                         });
                     }
-                    ServerEvent::SwarmStatus { members } => {
-                        live_swarm = Some((members.clone(), std::time::Instant::now()));
-                        if runtime
-                            .emit_swarm_status(&mut mapper, &active.session_id, &members)
-                            .await
-                            .is_err()
-                        {
-                            return;
-                        }
-                    }
                     ServerEvent::TextDelta { .. }
                     | ServerEvent::TextReplace { .. }
                     | ServerEvent::ReasoningDelta { .. }
@@ -1078,6 +1035,7 @@ impl AcpRuntime {
                     | ServerEvent::ToolExec { .. }
                     | ServerEvent::ToolOutput { .. }
                     | ServerEvent::ToolDone { .. }
+                    | ServerEvent::SwarmStatus { .. }
                     | ServerEvent::SwarmPlan { .. } => {
                         for update in mapper.map_event(event) {
                             if runtime
@@ -2026,57 +1984,6 @@ fn compact_swarm_label(text: &str) -> String {
     label
 }
 
-impl AcpRuntime {
-    /// Emit one ACP update per swarm member whose snapshot changed. Returns an
-    /// error when the editor connection is gone so the caller can stop.
-    async fn emit_swarm_status(
-        &self,
-        mapper: &mut EventMapper,
-        session_id: &str,
-        members: &[crate::protocol::SwarmMemberStatus],
-    ) -> Result<()> {
-        for update in mapper.map_event(ServerEvent::SwarmStatus {
-            members: members.to_vec(),
-        }) {
-            self.write_notification(
-                "session/update",
-                json!({"sessionId": session_id, "update": update}),
-            )
-            .await?;
-        }
-        Ok(())
-    }
-}
-
-/// Statuses that mean the worker is still doing something.
-fn swarm_member_is_active(member: &crate::protocol::SwarmMemberStatus) -> bool {
-    matches!(
-        member.status.as_str(),
-        "queued" | "running" | "working" | "busy" | "thinking" | "streaming"
-    )
-}
-
-/// The daemon reports elapsed time only when a member's status changes, so a
-/// quiet worker would freeze on screen. Add the wall-clock time since that
-/// snapshot for members that are still active; finished workers stay final.
-fn refresh_swarm_elapsed(
-    members: &[crate::protocol::SwarmMemberStatus],
-    extra_secs: u64,
-) -> Vec<crate::protocol::SwarmMemberStatus> {
-    members
-        .iter()
-        .cloned()
-        .map(|mut member| {
-            if swarm_member_is_active(&member)
-                && let Some(secs) = member.runtime.elapsed_secs
-            {
-                member.runtime.elapsed_secs = Some(secs.saturating_add(extra_secs));
-            }
-            member
-        })
-        .collect()
-}
-
 fn acp_usage_listing(state: &SessionUiState) -> String {
     let tier = state
         .service_tier
@@ -2657,8 +2564,8 @@ impl EventMapper {
                     if let Some((done, total)) = member.todo_progress {
                         title.push_str(&format!(" · {done}/{total} tasks"));
                     }
-                    if let Some(secs) = member.runtime.elapsed_secs.filter(|secs| *secs >= 5) {
-                        title.push_str(&format!(" · {}s", secs / 5 * 5));
+                    if let Some(secs) = member.runtime.elapsed_secs.filter(|secs| *secs >= 15) {
+                        title.push_str(&format!(" · {}s", secs / 15 * 15));
                     }
                     let task = member
                         .task_label
@@ -3940,24 +3847,6 @@ mod tests {
                 })
                 .is_empty()
         );
-    }
-
-    #[test]
-    fn swarm_elapsed_advances_only_for_active_workers() {
-        let active: crate::protocol::SwarmMemberStatus = serde_json::from_value(json!({
-            "session_id": "child", "status": "running", "friendly_name": "Researcher",
-            "report_back_to_session_id": "parent", "runtime": {"elapsed_secs": 30}
-        }))
-        .unwrap();
-        let finished: crate::protocol::SwarmMemberStatus = serde_json::from_value(json!({
-            "session_id": "other", "status": "completed", "friendly_name": "Reviewer",
-            "report_back_to_session_id": "parent", "runtime": {"elapsed_secs": 90}
-        }))
-        .unwrap();
-        let refreshed = refresh_swarm_elapsed(&[active, finished], 25);
-        assert_eq!(refreshed[0].runtime.elapsed_secs, Some(55));
-        // A finished worker's elapsed time is final and must not keep growing.
-        assert_eq!(refreshed[1].runtime.elapsed_secs, Some(90));
     }
 
     fn acp_test_skills() -> (tempfile::TempDir, crate::skill::SkillRegistry) {
