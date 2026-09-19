@@ -987,7 +987,10 @@ impl AcpRuntime {
             let mut mapper = EventMapper::new(active.session_id.clone(), runtime.profile);
             mapper.working_dir = active.working_dir.clone();
             loop {
-                let event = match active.read_wire_event().await {
+                // Session load/configuration can defer unsolicited events while
+                // waiting for its control replies. Consume that queue first, or
+                // an await wake that lands during attach never reaches Zed.
+                let event = match active.read_event().await {
                     Ok(event) => event,
                     Err(err) => {
                         let _ = runtime.write_notification("session/update", json!({"sessionId":active.session_id,"update":agent_message_chunk("JCode disconnected. Reload this session to reconnect; do not resend a command until its state is checked.".into())})).await;
