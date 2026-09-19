@@ -985,7 +985,6 @@ impl AcpRuntime {
         let active = session.clone();
         let task = tokio::spawn(async move {
             let mut mapper = EventMapper::new(active.session_id.clone(), runtime.profile);
-            let mut last_swarm_progress = None;
             mapper.working_dir = active.working_dir.clone();
             loop {
                 // Session load/configuration can defer unsolicited events while
@@ -1026,41 +1025,6 @@ impl AcpRuntime {
                                 .await;
                         });
                     }
-                    ServerEvent::SwarmStatus { members } => {
-                        let progress = (!active.prompt_running.load(Ordering::SeqCst))
-                            .then(|| active_swarm_progress(&active.session_id, &members))
-                            .flatten();
-                        let progress_changed = progress != last_swarm_progress;
-                        last_swarm_progress = progress.clone();
-                        let updates = mapper.map_event(ServerEvent::SwarmStatus { members });
-                        // Zed currently does not reliably repaint content inside
-                        // an in-progress ACP tool card. Keep the structured cards,
-                        // but add a compact text fallback while the parent is idle.
-                        if progress_changed
-                            && let Some(progress) = progress
-                            && runtime
-                                .write_notification(
-                                    "session/update",
-                                    json!({"sessionId":active.session_id,"update":agent_message_chunk(progress)}),
-                                )
-                                .await
-                                .is_err()
-                        {
-                            return;
-                        }
-                        for update in updates {
-                            if runtime
-                                .write_notification(
-                                    "session/update",
-                                    json!({"sessionId":active.session_id,"update":update}),
-                                )
-                                .await
-                                .is_err()
-                            {
-                                return;
-                            }
-                        }
-                    }
                     ServerEvent::TextDelta { .. }
                     | ServerEvent::TextReplace { .. }
                     | ServerEvent::ReasoningDelta { .. }
@@ -1071,6 +1035,7 @@ impl AcpRuntime {
                     | ServerEvent::ToolExec { .. }
                     | ServerEvent::ToolOutput { .. }
                     | ServerEvent::ToolDone { .. }
+                    | ServerEvent::SwarmStatus { .. }
                     | ServerEvent::SwarmPlan { .. } => {
                         for update in mapper.map_event(event) {
                             if runtime
@@ -2019,53 +1984,6 @@ fn compact_swarm_label(text: &str) -> String {
     label
 }
 
-fn active_swarm_progress(
-    session_id: &str,
-    members: &[crate::protocol::SwarmMemberStatus],
-) -> Option<String> {
-    let active: Vec<_> = members
-        .iter()
-        .filter(|member| {
-            member.report_back_to_session_id.as_deref() == Some(session_id)
-                && matches!(
-                    member.status.as_str(),
-                    "queued" | "running" | "working" | "busy" | "thinking" | "streaming"
-                )
-        })
-        .collect();
-    if active.is_empty() {
-        return None;
-    }
-
-    let mut items: Vec<String> = active
-        .iter()
-        .take(3)
-        .map(|member| {
-            let name = member
-                .friendly_name
-                .as_deref()
-                .unwrap_or(&member.session_id);
-            let mut item = format!("{name}: {}", member.status);
-            if let Some((done, total)) = member.todo_progress {
-                item.push_str(&format!(" ({done}/{total} tasks)"));
-            } else if let Some(detail) = member.detail.as_deref() {
-                let detail = compact_swarm_label(detail);
-                if !detail.is_empty() {
-                    item.push_str(&format!(" ({detail})"));
-                }
-            }
-            item
-        })
-        .collect();
-    if active.len() > items.len() {
-        items.push(format!("+{} more", active.len() - items.len()));
-    }
-    Some(format!(
-        "\n🐝 **Subagents active:** {}\n",
-        items.join(" · ")
-    ))
-}
-
 fn acp_usage_listing(state: &SessionUiState) -> String {
     let tier = state
         .service_tier
@@ -2639,40 +2557,20 @@ impl EventMapper {
                         .friendly_name
                         .as_deref()
                         .unwrap_or(&member.session_id);
-                    let summary = format!(
-                        "{}: {}{}{}",
-                        name,
-                        member.status,
-                        member
-                            .task_label
-                            .as_ref()
-                            .map(|v| format!(" — {}", compact_swarm_label(v)))
-                            .unwrap_or_default(),
-                        member
-                            .runtime
-                            .model
-                            .as_ref()
-                            .map(|v| format!(" ({v})"))
-                            .unwrap_or_default()
-                    );
-                    let detail = format!(
-                        "{}{}{}",
-                        member
-                            .detail
-                            .as_deref()
-                            .map(compact_swarm_label)
-                            .unwrap_or_default(),
-                        member
-                            .todo_progress
-                            .map(|(done, total)| format!(" · {done}/{total} tasks"))
-                            .unwrap_or_default(),
-                        member
-                            .runtime
-                            .elapsed_secs
-                            .map(|secs| format!(" · {}s elapsed at last update", secs / 15 * 15))
-                            .unwrap_or_default()
-                    );
-                    let snapshot = format!("{summary}\n{detail}");
+                    let mut title = format!("🐝 {} · {}", compact_swarm_label(name), member.status);
+                    if let Some((done, total)) = member.todo_progress {
+                        title.push_str(&format!(" · {done}/{total}"));
+                    }
+                    if let Some(secs) = member.runtime.elapsed_secs.filter(|secs| *secs >= 15) {
+                        title.push_str(&format!(" · {}s", secs / 15 * 15));
+                    }
+                    let detail = member
+                        .task_label
+                        .as_deref()
+                        .or(member.detail.as_deref())
+                        .map(compact_swarm_label)
+                        .unwrap_or_default();
+                    let snapshot = title.clone();
                     if self.swarm_status.get(&id) == Some(&snapshot) {
                         continue;
                     }
@@ -2685,7 +2583,7 @@ impl EventMapper {
                     };
                     updates.push(json!({
                         "sessionUpdate": if first { "tool_call" } else { "tool_call_update" },
-                        "toolCallId": id, "title": format!("Swarm: {summary}"),
+                        "toolCallId": id, "title": title,
                         "kind": "other", "status": status,
                         "content": [{"type":"content", "content":{"type":"text", "text":detail}}],
                     }));
@@ -3876,17 +3774,16 @@ mod tests {
         let mut mapper = EventMapper::new("parent".into(), AcpProfile::Standard);
         let member: crate::protocol::SwarmMemberStatus = serde_json::from_value(json!({
             "session_id": "child", "status": "running", "friendly_name": "Researcher",
-            "todo_progress": [1, 3],
-            "report_back_to_session_id": "parent", "runtime": {"model":"deepseek-v4.1-flash"}
+            "todo_progress": [1, 3], "report_back_to_session_id": "parent",
+            "runtime": {"model":"deepseek-v4.1-flash", "elapsed_secs":31}
         }))
         .unwrap();
-        let progress = active_swarm_progress("parent", std::slice::from_ref(&member)).unwrap();
-        assert!(progress.contains("Researcher: running (1/3 tasks)"));
         let event = mapper.map_event(ServerEvent::SwarmStatus {
             members: vec![member.clone()],
         });
         assert_eq!(event[0]["sessionUpdate"], "tool_call");
         assert_eq!(event[0]["status"], "in_progress");
+        assert_eq!(event[0]["title"], "🐝 Researcher · running · 1/3 · 30s");
         assert!(
             mapper
                 .map_event(ServerEvent::SwarmStatus {
@@ -3894,9 +3791,16 @@ mod tests {
                 })
                 .is_empty()
         );
+        let mut advanced = member.clone();
+        advanced.todo_progress = Some((2, 3));
+        advanced.runtime.elapsed_secs = Some(46);
+        let update = mapper.map_event(ServerEvent::SwarmStatus {
+            members: vec![advanced],
+        });
+        assert_eq!(update[0]["sessionUpdate"], "tool_call_update");
+        assert_eq!(update[0]["title"], "🐝 Researcher · running · 2/3 · 45s");
         let mut unrelated = member;
         unrelated.report_back_to_session_id = Some("someone-else".into());
-        assert!(active_swarm_progress("parent", std::slice::from_ref(&unrelated)).is_none());
         assert!(
             mapper
                 .map_event(ServerEvent::SwarmStatus {
