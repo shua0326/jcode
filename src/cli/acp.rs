@@ -985,6 +985,7 @@ impl AcpRuntime {
         let active = session.clone();
         let task = tokio::spawn(async move {
             let mut mapper = EventMapper::new(active.session_id.clone(), runtime.profile);
+            let mut last_swarm_progress = None;
             mapper.working_dir = active.working_dir.clone();
             loop {
                 // Session load/configuration can defer unsolicited events while
@@ -1029,14 +1030,14 @@ impl AcpRuntime {
                         let progress = (!active.prompt_running.load(Ordering::SeqCst))
                             .then(|| active_swarm_progress(&active.session_id, &members))
                             .flatten();
+                        let progress_changed = progress != last_swarm_progress;
+                        last_swarm_progress = progress.clone();
                         let updates = mapper.map_event(ServerEvent::SwarmStatus { members });
-                        if updates.is_empty() {
-                            continue;
-                        }
                         // Zed currently does not reliably repaint content inside
                         // an in-progress ACP tool card. Keep the structured cards,
                         // but add a compact text fallback while the parent is idle.
-                        if let Some(progress) = progress
+                        if progress_changed
+                            && let Some(progress) = progress
                             && runtime
                                 .write_notification(
                                     "session/update",
